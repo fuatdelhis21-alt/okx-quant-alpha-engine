@@ -1,0 +1,15 @@
+[package]
+name = "qae-websocket-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+qae-core = { path = "../core" }
+qae-config = { path = "../config" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
