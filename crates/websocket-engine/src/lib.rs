@@ -1,7 +1,10 @@
 use crc32fast::hash;
 use futures_util::{SinkExt, StreamExt};
 use qae_config::AppConfig;
-use qae_core::{InstrumentId, RuntimeMode};
+use qae_core::{
+    AccountBalance, ExecutionReport, FillUpdate, InstrumentId, OrderSide, OrderStatus,
+    PositionUpdate, PrivateStreamEvent, RuntimeMode,
+};
 use qae_market_data::{
     MarketDataError, MarketDataUpdate, MarketSnapshot, OrderBookLevel, OrderBookSnapshot, Ticker,
 };
@@ -181,7 +184,7 @@ impl WebsocketEngine {
             .iter()
             .map(|subscription| SubscriptionArg {
                 channel: subscription.channel.as_okx_channel(self.order_book_depth),
-                inst_id: subscription.instrument_id.as_str(),
+                inst_id: Some(subscription.instrument_id.as_str()),
             })
             .collect::<Vec<_>>();
 
@@ -191,6 +194,25 @@ impl WebsocketEngine {
                 args,
             })
             .expect("subscription serialization must succeed"),
+        ]
+    }
+
+    #[must_use]
+    pub fn private_subscription_requests(&self) -> Vec<String> {
+        let args = ["account", "orders", "positions", "fills"]
+            .into_iter()
+            .map(|channel| SubscriptionArg {
+                channel,
+                inst_id: None,
+            })
+            .collect::<Vec<_>>();
+
+        vec![
+            serde_json::to_string(&SubscriptionRequest {
+                op: "subscribe",
+                args,
+            })
+            .expect("private subscription serialization must succeed"),
         ]
     }
 
@@ -231,11 +253,12 @@ impl WebsocketEngine {
         &mut self,
         endpoint: &str,
         login_command: &str,
+        max_events: usize,
         max_duration: Duration,
-    ) -> Result<(), WebsocketEngineError> {
-        if max_duration.is_zero() {
+    ) -> Result<Vec<PrivateStreamEvent>, WebsocketEngineError> {
+        if max_events == 0 || max_duration.is_zero() {
             self.state = ConnectionState::Stopped;
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         self.begin_connecting();
@@ -248,9 +271,14 @@ impl WebsocketEngine {
         self.send_commands(&mut socket, [login_command.to_string()])
             .await?;
         self.await_private_login(&mut socket, max_duration).await?;
+        self.send_commands(&mut socket, self.private_subscription_requests())
+            .await?;
+        let events = self
+            .collect_private_events(&mut socket, max_events, max_duration)
+            .await?;
         self.state = ConnectionState::Stopped;
 
-        Ok(())
+        Ok(events)
     }
 
     pub fn ingest_text_frame(
@@ -290,6 +318,35 @@ impl WebsocketEngine {
         }
 
         Ok(updates)
+    }
+
+    pub fn ingest_private_text_frame(
+        &mut self,
+        payload: &str,
+    ) -> Result<Vec<PrivateStreamEvent>, WebsocketEngineError> {
+        let frame: IncomingFrame = serde_json::from_str(payload)
+            .map_err(|source| WebsocketEngineError::InvalidFrame(source.to_string()))?;
+
+        if frame.event.is_some() && frame.data.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let arg = frame.arg.ok_or(WebsocketEngineError::MissingFrameArg)?;
+        let mut events = Vec::new();
+
+        for entry in frame.data.unwrap_or_default() {
+            match arg.channel.as_str() {
+                "account" => events.extend(parse_account_event(entry)?),
+                "orders" => events.push(PrivateStreamEvent::Order(parse_order_event(entry)?)),
+                "positions" => {
+                    events.push(PrivateStreamEvent::Position(parse_position_event(entry)?))
+                }
+                "fills" => events.push(PrivateStreamEvent::Fill(parse_fill_event(entry)?)),
+                other => return Err(WebsocketEngineError::UnsupportedChannel(other.to_string())),
+            }
+        }
+
+        Ok(events)
     }
 
     #[must_use]
@@ -408,6 +465,75 @@ impl WebsocketEngine {
         }
 
         Ok(updates)
+    }
+
+    async fn collect_private_events<S>(
+        &mut self,
+        socket: &mut S,
+        max_events: usize,
+        max_duration: Duration,
+    ) -> Result<Vec<PrivateStreamEvent>, WebsocketEngineError>
+    where
+        S: futures_util::Stream<Item = Result<Message, TungsteniteError>>
+            + futures_util::Sink<Message, Error = TungsteniteError>
+            + Unpin,
+    {
+        let mut events = Vec::new();
+        let mut heartbeat = HeartbeatSupervisor::new(self.heartbeat_policy.clone());
+        let deadline = time::Instant::now() + max_duration;
+
+        while events.len() < max_events {
+            let now = time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let wait_for = remaining.min(self.heartbeat_policy.heartbeat_interval);
+
+            match time::timeout(wait_for, socket.next()).await {
+                Ok(Some(Ok(Message::Text(payload)))) => {
+                    heartbeat.mark_heartbeat();
+                    events.extend(self.ingest_private_text_frame(payload.as_str())?);
+                }
+                Ok(Some(Ok(Message::Ping(payload)))) => {
+                    heartbeat.mark_heartbeat();
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|source| self.register_transport_error(source))?;
+                }
+                Ok(Some(Ok(Message::Pong(_)))) | Ok(Some(Ok(Message::Binary(_)))) => {
+                    heartbeat.mark_heartbeat();
+                }
+                Ok(Some(Ok(Message::Close(_)))) => {
+                    self.state = ConnectionState::Stopped;
+                    break;
+                }
+                Ok(Some(Ok(Message::Frame(_)))) => {}
+                Ok(Some(Err(source))) => return Err(self.register_transport_error(source)),
+                Ok(None) => {
+                    self.state = ConnectionState::Stopped;
+                    break;
+                }
+                Err(_) => {
+                    if heartbeat.is_timed_out() {
+                        self.health.missed_heartbeats += 1;
+                        let error = WebsocketEngineError::HeartbeatTimedOut;
+                        self.register_disconnect(error.to_string());
+                        return Err(error);
+                    }
+
+                    socket
+                        .send(Message::Ping(Vec::new().into()))
+                        .await
+                        .map_err(|source| self.register_transport_error(source))?;
+                    heartbeat.mark_heartbeat();
+                }
+            }
+        }
+
+        Ok(events)
     }
 
     async fn await_private_login<S>(
@@ -586,6 +712,104 @@ fn parse_i64(value: &str) -> Result<i64, WebsocketEngineError> {
     i64::from_str(value).map_err(|_| WebsocketEngineError::InvalidNumber(value.to_string()))
 }
 
+fn parse_account_event(
+    value: serde_json::Value,
+) -> Result<Vec<PrivateStreamEvent>, WebsocketEngineError> {
+    let payload: AccountPayload = serde_json::from_value(value)
+        .map_err(|source| WebsocketEngineError::InvalidFrame(source.to_string()))?;
+
+    payload
+        .details
+        .into_iter()
+        .map(|detail| {
+            Ok(PrivateStreamEvent::Account(AccountBalance {
+                currency: detail.currency,
+                equity: parse_f64(&detail.equity)?,
+                available_equity: parse_f64(&detail.available_equity)?,
+            }))
+        })
+        .collect()
+}
+
+fn parse_order_event(value: serde_json::Value) -> Result<ExecutionReport, WebsocketEngineError> {
+    let payload: OrderEventPayload = serde_json::from_value(value)
+        .map_err(|source| WebsocketEngineError::InvalidFrame(source.to_string()))?;
+    let instrument_id = InstrumentId::new(payload.inst_id.clone())
+        .map_err(|_| WebsocketEngineError::InvalidInstrument(payload.inst_id))?;
+    let quantity = parse_f64(&payload.size)?;
+    let filled_quantity = parse_f64(payload.acc_fill_sz.as_deref().unwrap_or("0"))?;
+    let remaining_quantity = (quantity - filled_quantity).max(0.0);
+    let status = match payload.state.as_str() {
+        "live" | "effective" => OrderStatus::Accepted,
+        "partially_filled" => OrderStatus::PartiallyFilled,
+        "filled" => OrderStatus::Filled,
+        "canceled" | "mmp_canceled" => OrderStatus::Cancelled,
+        "rejected" => OrderStatus::Rejected,
+        other => return Err(WebsocketEngineError::UnsupportedOrderState(other.to_string())),
+    };
+
+    Ok(ExecutionReport {
+        order_id: payload
+            .ord_id
+            .clone()
+            .or_else(|| payload.cl_ord_id.clone())
+            .unwrap_or_else(|| instrument_id.to_string()),
+        client_order_id: payload.cl_ord_id,
+        venue_order_id: payload.ord_id,
+        instrument_id,
+        status,
+        filled_quantity,
+        remaining_quantity,
+        average_fill_price: payload.avg_px.as_deref().map(parse_f64).transpose()?,
+        rejection_reason: payload
+            .status_message
+            .filter(|_| payload.status_code.as_deref().unwrap_or("0") != "0"),
+    })
+}
+
+fn parse_position_event(value: serde_json::Value) -> Result<PositionUpdate, WebsocketEngineError> {
+    let payload: PositionPayload = serde_json::from_value(value)
+        .map_err(|source| WebsocketEngineError::InvalidFrame(source.to_string()))?;
+    let instrument_id = InstrumentId::new(payload.inst_id.clone())
+        .map_err(|_| WebsocketEngineError::InvalidInstrument(payload.inst_id))?;
+    let quantity = parse_f64(&payload.position)?;
+
+    Ok(PositionUpdate {
+        instrument_id,
+        side: match payload.position_side.as_deref() {
+            Some("short") => OrderSide::Sell,
+            _ => OrderSide::Buy,
+        },
+        quantity,
+        average_entry_price: payload.avg_px.as_deref().map(parse_f64).transpose()?,
+        unrealized_pnl: payload.upl.as_deref().map(parse_f64).transpose()?,
+    })
+}
+
+fn parse_fill_event(value: serde_json::Value) -> Result<FillUpdate, WebsocketEngineError> {
+    let payload: FillPayload = serde_json::from_value(value)
+        .map_err(|source| WebsocketEngineError::InvalidFrame(source.to_string()))?;
+    let instrument_id = InstrumentId::new(payload.inst_id.clone())
+        .map_err(|_| WebsocketEngineError::InvalidInstrument(payload.inst_id))?;
+
+    Ok(FillUpdate {
+        order_id: payload
+            .ord_id
+            .clone()
+            .or_else(|| payload.cl_ord_id.clone())
+            .unwrap_or_else(|| instrument_id.to_string()),
+        client_order_id: payload.cl_ord_id,
+        instrument_id,
+        side: match payload.side.as_str() {
+            "buy" => OrderSide::Buy,
+            "sell" => OrderSide::Sell,
+            other => return Err(WebsocketEngineError::UnsupportedSide(other.to_string())),
+        },
+        fill_price: parse_f64(&payload.fill_px)?,
+        fill_quantity: parse_f64(&payload.fill_sz)?,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct IncomingFrame {
     event: Option<String>,
@@ -617,8 +841,8 @@ struct SubscriptionRequest<'a> {
 #[derive(Debug, Serialize)]
 struct SubscriptionArg<'a> {
     channel: &'static str,
-    #[serde(rename = "instId")]
-    inst_id: &'a str,
+    #[serde(rename = "instId", skip_serializing_if = "Option::is_none")]
+    inst_id: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -637,6 +861,70 @@ struct OrderBookPayload {
     asks: Vec<RawOrderBookLevel>,
     ts: String,
     checksum: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountPayload {
+    details: Vec<AccountDetailPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountDetailPayload {
+    #[serde(rename = "ccy")]
+    currency: String,
+    #[serde(rename = "eq")]
+    equity: String,
+    #[serde(rename = "availEq")]
+    available_equity: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderEventPayload {
+    #[serde(rename = "instId")]
+    inst_id: String,
+    #[serde(rename = "ordId")]
+    ord_id: Option<String>,
+    #[serde(rename = "clOrdId")]
+    cl_ord_id: Option<String>,
+    state: String,
+    #[serde(rename = "sz")]
+    size: String,
+    #[serde(rename = "accFillSz")]
+    acc_fill_sz: Option<String>,
+    #[serde(rename = "avgPx")]
+    avg_px: Option<String>,
+    #[serde(rename = "sCode")]
+    status_code: Option<String>,
+    #[serde(rename = "sMsg")]
+    status_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PositionPayload {
+    #[serde(rename = "instId")]
+    inst_id: String,
+    #[serde(rename = "pos")]
+    position: String,
+    #[serde(rename = "posSide")]
+    position_side: Option<String>,
+    #[serde(rename = "avgPx")]
+    avg_px: Option<String>,
+    upl: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FillPayload {
+    #[serde(rename = "instId")]
+    inst_id: String,
+    #[serde(rename = "ordId")]
+    ord_id: Option<String>,
+    #[serde(rename = "clOrdId")]
+    cl_ord_id: Option<String>,
+    side: String,
+    #[serde(rename = "fillPx")]
+    fill_px: String,
+    #[serde(rename = "fillSz")]
+    fill_sz: String,
 }
 
 type RawOrderBookLevel = (String, String, IgnoredAny, IgnoredAny);
@@ -805,6 +1093,10 @@ pub enum WebsocketEngineError {
     InvalidNumber(String),
     #[error("invalid instrument id: {0}")]
     InvalidInstrument(String),
+    #[error("unsupported order state: {0}")]
+    UnsupportedOrderState(String),
+    #[error("unsupported side: {0}")]
+    UnsupportedSide(String),
     #[error("order book checksum mismatch: expected {expected}, got {actual}")]
     ChecksumMismatch { expected: i64, actual: i64 },
     #[error("private websocket control rejected: {0}")]
@@ -858,6 +1150,20 @@ mod tests {
         assert!(request.contains(r#""channel":"tickers""#));
         assert!(request.contains(r#""channel":"books5""#));
         assert!(request.contains(r#""instId":"BTC-USDT-SWAP""#));
+    }
+
+    #[test]
+    fn emits_private_subscription_request_payloads() {
+        let cfg = AppConfig::default();
+        let engine = WebsocketEngine::new(&cfg).expect("engine");
+        let mut requests = engine.private_subscription_requests();
+        let request = requests.pop().expect("request");
+
+        assert!(request.contains(r#""channel":"account""#));
+        assert!(request.contains(r#""channel":"orders""#));
+        assert!(request.contains(r#""channel":"positions""#));
+        assert!(request.contains(r#""channel":"fills""#));
+        assert!(!request.contains(r#""instId""#));
     }
 
     #[test]
@@ -1031,19 +1337,37 @@ mod tests {
                 ))
                 .await
                 .expect("ack");
+
+            let second_message = socket
+                .next()
+                .await
+                .expect("message")
+                .expect("socket message");
+            let payload = second_message.into_text().expect("text");
+            assert!(payload.contains(r#""channel":"account""#));
+            assert!(payload.contains(r#""channel":"orders""#));
+
+            socket
+                .send(Message::Text(
+                    r#"{"arg":{"channel":"account"},"data":[{"details":[{"ccy":"USDT","eq":"1000.0","availEq":"900.0"}]}]}"#.into(),
+                ))
+                .await
+                .expect("account");
         });
 
         let cfg = AppConfig::default();
         let mut engine = WebsocketEngine::new(&cfg).expect("engine");
-        engine
+        let events = engine
             .connect_private_stream(
                 &format!("ws://{addr}"),
                 r#"{"op":"login","args":[{"apiKey":"k"}]}"#,
+                1,
                 Duration::from_secs(2),
             )
             .await
             .expect("login");
 
+        assert_eq!(events.len(), 1);
         assert_eq!(engine.state, ConnectionState::Stopped);
         server.await.expect("server");
     }

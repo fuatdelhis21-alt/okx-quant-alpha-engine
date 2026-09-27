@@ -4,9 +4,7 @@ use qae_core::{
     PrivateStreamEvent, RuntimeMode,
 };
 use qae_market_data::MarketSnapshot;
-use qae_okx_client::{
-    HmacSha256Signer, OkxClient, OkxClientError, RequestSigner, ReqwestLiveOrderTransport,
-};
+use qae_okx_client::{OkxClient, OkxClientError, RequestSigner, ReqwestLiveOrderTransport};
 use qae_risk::{PortfolioRiskManager, PortfolioRiskState, RiskManager, RiskViolation};
 use qae_time::WallClock;
 use std::collections::BTreeMap;
@@ -308,6 +306,7 @@ mod tests {
     use chrono::{DateTime, TimeZone, Utc};
     use qae_core::{InstrumentId, OrderRequest, OrderSide, OrderType};
     use qae_market_data::{MarketSnapshot, OrderBookLevel, OrderBookSnapshot, Ticker};
+    use qae_okx_client::HmacSha256Signer;
     use qae_time::ExchangeTimestamp;
 
     struct FixedClock(DateTime<Utc>);

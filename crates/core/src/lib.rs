@@ -57,7 +57,7 @@ pub enum RequestPriority {
     Critical,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InstrumentId(String);
 
 impl InstrumentId {

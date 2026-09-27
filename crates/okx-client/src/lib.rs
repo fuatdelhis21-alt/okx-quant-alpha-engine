@@ -2,10 +2,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use qae_config::{AppConfig, WsEndpointKind};
-use qae_core::{
-    ExecutionReport, InstrumentId, OrderRequest, OrderSide, OrderStatus, OrderType,
-    RequestPriority, RuntimeMode,
-};
+use qae_core::{ExecutionReport, OrderRequest, OrderSide, OrderStatus, OrderType, RequestPriority, RuntimeMode};
 use qae_time::{ExchangeTimestamp, WallClock};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -240,7 +237,11 @@ impl LiveOrderTransport for ReqwestLiveOrderTransport {
         let mut builder = self
             .client
             .request(
-                request.request.method.parse().map_err(OkxClientError::InvalidMethod)?,
+                request
+                    .request
+                    .method
+                    .parse()
+                    .map_err(|_| OkxClientError::InvalidMethod(request.request.method.clone()))?,
                 url,
             )
             .timeout(std::time::Duration::from_millis(timeout_ms))
@@ -419,7 +420,7 @@ pub enum OkxClientError {
     #[error("failed to read HTTP response: {0}")]
     ReadResponse(reqwest::Error),
     #[error("invalid HTTP method: {0}")]
-    InvalidMethod(reqwest::Method),
+    InvalidMethod(String),
     #[error("failed to join endpoint URL: {0}")]
     JoinUrl(url::ParseError),
     #[error("live trading is disabled by runtime configuration")]
@@ -439,6 +440,7 @@ mod tests {
     use super::*;
     use chrono::{DateTime, TimeZone, Utc};
     use qae_config::ApiCredentials;
+    use qae_core::InstrumentId;
 
     struct FixedClock(DateTime<Utc>);
 

@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
     let mut websocket_engine =
         WebsocketEngine::new(&config).context("websocket engine configuration invalid")?;
     let risk_manager = RiskManager::new(&config).context("risk manager configuration invalid")?;
-    let _execution_gateway =
+    let mut execution_gateway =
         ExecutionGateway::new(&config).context("execution gateway configuration invalid")?;
 
     info!(
@@ -70,16 +70,23 @@ async fn main() -> Result<()> {
             .build_ws_login_command(&HmacSha256Signer, &SystemWallClock)
             .context("failed to build private websocket login command")?;
 
-        websocket_engine
+        let events = websocket_engine
             .connect_private_stream(
                 config.okx.endpoints.private_ws.as_str(),
                 &login_command,
+                config.market_data.startup_stream_updates_limit as usize,
                 Duration::from_millis(config.market_data.startup_stream_timeout_ms),
             )
             .await
             .context("failed to authenticate private websocket stream")?;
 
-        info!("private websocket startup authentication completed");
+        for event in events {
+            if let Some(report) = execution_gateway.apply_private_event(event) {
+                info!(order_id = %report.order_id, status = ?report.status, "reconciled private order event");
+            }
+        }
+
+        info!("private websocket startup authentication and subscription handling completed");
     } else {
         info!("private websocket startup session disabled by configuration");
     }
