@@ -1,3 +1,4 @@
+use futures_util::{SinkExt, StreamExt};
 use qae_config::AppConfig;
 use qae_core::{InstrumentId, RuntimeMode};
 use qae_market_data::{
@@ -11,6 +12,9 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::time;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::{Error as TungsteniteError, Message};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -187,6 +191,39 @@ impl WebsocketEngine {
         )]
     }
 
+    pub async fn connect_public_stream(
+        &mut self,
+        endpoint: &str,
+        max_updates: usize,
+        max_duration: Duration,
+    ) -> Result<Vec<MarketDataUpdate>, WebsocketEngineError> {
+        if max_updates == 0 || max_duration.is_zero() {
+            self.state = ConnectionState::Stopped;
+            return Ok(Vec::new());
+        }
+
+        self.begin_connecting();
+
+        let (mut socket, _) = connect_async(endpoint)
+            .await
+            .map_err(|source| self.register_transport_error(source))?;
+
+        self.mark_connected();
+        self.send_subscriptions(&mut socket).await?;
+        let updates = self
+            .collect_updates(&mut socket, max_updates, max_duration)
+            .await?;
+
+        if matches!(
+            self.state,
+            ConnectionState::Connected | ConnectionState::Connecting
+        ) {
+            self.state = ConnectionState::Stopped;
+        }
+
+        Ok(updates)
+    }
+
     pub fn ingest_text_frame(
         &mut self,
         payload: &str,
@@ -242,6 +279,91 @@ impl WebsocketEngine {
         self.health.last_error = Some(err.into());
     }
 
+    async fn send_subscriptions<S>(&mut self, socket: &mut S) -> Result<(), WebsocketEngineError>
+    where
+        S: futures_util::Sink<Message, Error = TungsteniteError> + Unpin,
+    {
+        for request in self.subscription_requests() {
+            socket
+                .send(Message::Text(request.into()))
+                .await
+                .map_err(|source| self.register_transport_error(source))?;
+        }
+
+        Ok(())
+    }
+
+    async fn collect_updates<S>(
+        &mut self,
+        socket: &mut S,
+        max_updates: usize,
+        max_duration: Duration,
+    ) -> Result<Vec<MarketDataUpdate>, WebsocketEngineError>
+    where
+        S: futures_util::Stream<Item = Result<Message, TungsteniteError>>
+            + futures_util::Sink<Message, Error = TungsteniteError>
+            + Unpin,
+    {
+        let mut updates = Vec::new();
+        let mut heartbeat = HeartbeatSupervisor::new(self.heartbeat_policy.clone());
+        let deadline = time::Instant::now() + max_duration;
+
+        while updates.len() < max_updates {
+            let now = time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let wait_for = remaining.min(self.heartbeat_policy.heartbeat_interval);
+
+            match time::timeout(wait_for, socket.next()).await {
+                Ok(Some(Ok(Message::Text(payload)))) => {
+                    heartbeat.mark_heartbeat();
+                    updates.extend(self.ingest_text_frame(payload.as_str())?);
+                }
+                Ok(Some(Ok(Message::Ping(payload)))) => {
+                    heartbeat.mark_heartbeat();
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|source| self.register_transport_error(source))?;
+                }
+                Ok(Some(Ok(Message::Pong(_)))) => {
+                    heartbeat.mark_heartbeat();
+                }
+                Ok(Some(Ok(Message::Binary(_)))) => {
+                    heartbeat.mark_heartbeat();
+                }
+                Ok(Some(Ok(Message::Close(_)))) => {
+                    self.state = ConnectionState::Stopped;
+                    break;
+                }
+                Ok(Some(Ok(Message::Frame(_)))) => {}
+                Ok(Some(Err(source))) => return Err(self.register_transport_error(source)),
+                Ok(None) => {
+                    self.state = ConnectionState::Stopped;
+                    break;
+                }
+                Err(_) => {
+                    if heartbeat.is_timed_out() {
+                        self.health.missed_heartbeats += 1;
+                        let error = WebsocketEngineError::HeartbeatTimedOut;
+                        self.register_disconnect(error.to_string());
+                        return Err(error);
+                    }
+
+                    socket
+                        .send(Message::Ping(Vec::new().into()))
+                        .await
+                        .map_err(|source| self.register_transport_error(source))?;
+                }
+            }
+        }
+
+        Ok(updates)
+    }
+
     fn apply_update(&mut self, update: MarketDataUpdate) {
         match update {
             MarketDataUpdate::Ticker(ticker) => {
@@ -253,6 +375,12 @@ impl WebsocketEngine {
                 self.snapshots.entry(instrument_id).or_default().order_book = Some(order_book);
             }
         }
+    }
+
+    fn register_transport_error(&mut self, source: impl std::fmt::Display) -> WebsocketEngineError {
+        let error = WebsocketEngineError::Transport(source.to_string());
+        self.register_disconnect(error.to_string());
+        error
     }
 }
 
@@ -399,6 +527,10 @@ pub enum WebsocketEngineError {
     InvalidNumber(String),
     #[error("invalid instrument id: {0}")]
     InvalidInstrument(String),
+    #[error("websocket transport failed: {0}")]
+    Transport(String),
+    #[error("websocket heartbeat timed out")]
+    HeartbeatTimedOut,
     #[error("{0}")]
     MarketData(#[from] MarketDataError),
 }
@@ -407,6 +539,8 @@ pub enum WebsocketEngineError {
 mod tests {
     use super::*;
     use qae_config::AppConfig;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
 
     #[test]
     fn reconnect_backoff_grows_until_cap() {
@@ -483,5 +617,58 @@ mod tests {
                 .map(|level| level.price),
             Some(101.5)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connects_to_local_server_and_collects_updates() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut socket = accept_async(stream).await.expect("handshake");
+
+            let first_message = socket
+                .next()
+                .await
+                .expect("message")
+                .expect("socket message");
+            let payload = first_message.into_text().expect("text");
+            assert!(payload.contains(r#""op":"subscribe""#));
+
+            socket
+                .send(Message::Text(
+                    r#"{"event":"subscribe","arg":{"channel":"tickers","instId":"BTC-USDT-SWAP"}}"#
+                        .into(),
+                ))
+                .await
+                .expect("ack");
+            socket
+                .send(Message::Text(
+                    r#"{"arg":{"channel":"tickers","instId":"BTC-USDT-SWAP"},"data":[{"last":"101.0","bidPx":"100.5","askPx":"101.5","ts":"1700000000000"}]}"#
+                        .into(),
+                ))
+                .await
+                .expect("ticker");
+            socket
+                .send(Message::Text(
+                    r#"{"arg":{"channel":"books5","instId":"BTC-USDT-SWAP"},"data":[{"asks":[["101.5","2.0","0","1"]],"bids":[["101.0","1.5","0","1"]],"ts":"1700000000001","checksum":"7"}]}"#
+                        .into(),
+                ))
+                .await
+                .expect("book");
+        });
+
+        let cfg = AppConfig::default();
+        let mut engine = WebsocketEngine::new(&cfg).expect("engine");
+        let updates = engine
+            .connect_public_stream(&format!("ws://{addr}"), 2, Duration::from_secs(2))
+            .await
+            .expect("updates");
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(engine.state, ConnectionState::Stopped);
+
+        server.await.expect("server");
     }
 }

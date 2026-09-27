@@ -69,6 +69,9 @@ Environment variables:
   - `SUBSCRIBE_TICKERS`
   - `SUBSCRIBE_ORDER_BOOK`
   - `ORDER_BOOK_DEPTH`
+  - `CONNECT_PUBLIC_STREAM_ON_STARTUP`
+  - `STARTUP_STREAM_UPDATES_LIMIT`
+  - `STARTUP_STREAM_TIMEOUT_MS`
 - Risk
   - `RISK_MAX_ORDER_QUANTITY`
   - `RISK_MAX_ORDER_NOTIONAL`
@@ -91,3 +94,10 @@ cargo run -p trader
 ## Current limitations
 
 See `docs/phase1.md` for details on what remains intentionally out of scope and how the current scaffolding sets up later phases.
+
+## Optional startup websocket session
+
+The trader binary keeps external network access disabled by default. To exercise the public OKX WebSocket flow on startup, enable:
+
+- `CONNECT_PUBLIC_STREAM_ON_STARTUP=true`
+- optionally tune `STARTUP_STREAM_UPDATES_LIMIT` and `STARTUP_STREAM_TIMEOUT_MS`

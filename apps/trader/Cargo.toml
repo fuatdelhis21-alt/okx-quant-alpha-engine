@@ -10,7 +10,9 @@ anyhow.workspace = true
 qae-config = { path = "../../crates/config" }
 qae-core = { path = "../../crates/core" }
 qae-execution = { path = "../../crates/execution" }
+qae-market-data = { path = "../../crates/market-data" }
 qae-monitoring = { path = "../../crates/monitoring" }
 qae-risk = { path = "../../crates/risk" }
 qae-websocket-engine = { path = "../../crates/websocket-engine" }
+tokio.workspace = true
 tracing.workspace = true

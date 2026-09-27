@@ -126,6 +126,21 @@ impl AppConfig {
             self.market_data.order_book_depth = parse_u32("ORDER_BOOK_DEPTH", value)?;
         }
 
+        if let Some(value) = map.get("CONNECT_PUBLIC_STREAM_ON_STARTUP") {
+            self.market_data.connect_public_stream_on_startup =
+                parse_bool("CONNECT_PUBLIC_STREAM_ON_STARTUP", value)?;
+        }
+
+        if let Some(value) = map.get("STARTUP_STREAM_UPDATES_LIMIT") {
+            self.market_data.startup_stream_updates_limit =
+                parse_u32("STARTUP_STREAM_UPDATES_LIMIT", value)?;
+        }
+
+        if let Some(value) = map.get("STARTUP_STREAM_TIMEOUT_MS") {
+            self.market_data.startup_stream_timeout_ms =
+                parse_u64("STARTUP_STREAM_TIMEOUT_MS", value)?;
+        }
+
         if let Some(value) = map.get("RISK_MAX_ORDER_QUANTITY") {
             self.risk.max_order_quantity = parse_f64("RISK_MAX_ORDER_QUANTITY", value)?;
         }
@@ -189,6 +204,20 @@ impl AppConfig {
             return Err(ConfigError::InvalidValue {
                 name: "ORDER_BOOK_DEPTH",
                 value: self.market_data.order_book_depth.to_string(),
+            });
+        }
+
+        if self.market_data.startup_stream_updates_limit == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "STARTUP_STREAM_UPDATES_LIMIT",
+                value: self.market_data.startup_stream_updates_limit.to_string(),
+            });
+        }
+
+        if self.market_data.startup_stream_timeout_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "STARTUP_STREAM_TIMEOUT_MS",
+                value: self.market_data.startup_stream_timeout_ms.to_string(),
             });
         }
 
@@ -289,6 +318,18 @@ impl AppConfig {
             }
             if let Some(order_book_depth) = market_data.order_book_depth {
                 self.market_data.order_book_depth = order_book_depth;
+            }
+            if let Some(connect_public_stream_on_startup) =
+                market_data.connect_public_stream_on_startup
+            {
+                self.market_data.connect_public_stream_on_startup =
+                    connect_public_stream_on_startup;
+            }
+            if let Some(startup_stream_updates_limit) = market_data.startup_stream_updates_limit {
+                self.market_data.startup_stream_updates_limit = startup_stream_updates_limit;
+            }
+            if let Some(startup_stream_timeout_ms) = market_data.startup_stream_timeout_ms {
+                self.market_data.startup_stream_timeout_ms = startup_stream_timeout_ms;
             }
         }
 
@@ -411,6 +452,9 @@ pub struct MarketDataConfig {
     pub subscribe_tickers: bool,
     pub subscribe_order_book: bool,
     pub order_book_depth: u32,
+    pub connect_public_stream_on_startup: bool,
+    pub startup_stream_updates_limit: u32,
+    pub startup_stream_timeout_ms: u64,
 }
 
 impl Default for MarketDataConfig {
@@ -420,6 +464,9 @@ impl Default for MarketDataConfig {
             subscribe_tickers: true,
             subscribe_order_book: true,
             order_book_depth: 5,
+            connect_public_stream_on_startup: false,
+            startup_stream_updates_limit: 4,
+            startup_stream_timeout_ms: 3_000,
         }
     }
 }
@@ -585,6 +632,9 @@ struct TomlMarketDataConfig {
     subscribe_tickers: Option<bool>,
     subscribe_order_book: Option<bool>,
     order_book_depth: Option<u32>,
+    connect_public_stream_on_startup: Option<bool>,
+    startup_stream_updates_limit: Option<u32>,
+    startup_stream_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -615,6 +665,7 @@ mod tests {
             cfg.market_data.instruments,
             vec!["BTC-USDT-SWAP".to_string()]
         );
+        assert!(!cfg.market_data.connect_public_stream_on_startup);
     }
 
     #[test]
@@ -681,6 +732,7 @@ mod tests {
         cfg.apply_env_overrides(vec![
             ("MARKET_DATA_INSTRUMENTS", "BTC-USDT-SWAP,ETH-USDT-SWAP"),
             ("RISK_MAX_ORDER_NOTIONAL", "25000"),
+            ("CONNECT_PUBLIC_STREAM_ON_STARTUP", "true"),
         ])
         .expect("env should parse");
 
@@ -689,6 +741,7 @@ mod tests {
             vec!["BTC-USDT-SWAP".to_string(), "ETH-USDT-SWAP".to_string()]
         );
         assert_eq!(cfg.risk.max_order_notional, 25_000.0);
+        assert!(cfg.market_data.connect_public_stream_on_startup);
     }
 
     #[test]
@@ -712,6 +765,20 @@ mod tests {
             cfg.validate(),
             Err(ConfigError::InvalidValue {
                 name: "ORDER_BOOK_DEPTH",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_zero_startup_update_limit() {
+        let mut cfg = AppConfig::default();
+        cfg.market_data.startup_stream_updates_limit = 0;
+
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                name: "STARTUP_STREAM_UPDATES_LIMIT",
                 ..
             })
         ));

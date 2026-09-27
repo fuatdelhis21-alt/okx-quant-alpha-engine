@@ -4,9 +4,11 @@ use qae_execution::PaperExecutionEngine;
 use qae_monitoring::{MonitoringConfig, init_tracing};
 use qae_risk::RiskManager;
 use qae_websocket_engine::WebsocketEngine;
+use std::time::Duration;
 use tracing::{info, warn};
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     let config = AppConfig::load(None).context("failed to load configuration")?;
     init_tracing(&MonitoringConfig::default());
 
@@ -16,7 +18,7 @@ fn main() -> Result<()> {
         warn!("live trading is disabled; running in safe mode");
     }
 
-    let websocket_engine =
+    let mut websocket_engine =
         WebsocketEngine::new(&config).context("websocket engine configuration invalid")?;
     let risk_manager = RiskManager::new(&config).context("risk manager configuration invalid")?;
     let execution_engine =
@@ -34,6 +36,35 @@ fn main() -> Result<()> {
         ?execution_engine,
         "risk and paper execution scaffolding initialized"
     );
+
+    if config.market_data.connect_public_stream_on_startup {
+        let updates = websocket_engine
+            .connect_public_stream(
+                config.okx.endpoints.public_ws.as_str(),
+                config.market_data.startup_stream_updates_limit as usize,
+                Duration::from_millis(config.market_data.startup_stream_timeout_ms),
+            )
+            .await
+            .context("failed to collect public websocket updates")?;
+
+        info!(
+            received_updates = updates.len(),
+            cached_snapshots = updates
+                .iter()
+                .map(|update| match update {
+                    qae_market_data::MarketDataUpdate::Ticker(ticker) =>
+                        ticker.instrument_id.as_str(),
+                    qae_market_data::MarketDataUpdate::OrderBook(order_book) => {
+                        order_book.instrument_id.as_str()
+                    }
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "startup websocket session completed"
+        );
+    } else {
+        info!("public websocket startup session disabled by configuration");
+    }
 
     Ok(())
 }
