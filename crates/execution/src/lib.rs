@@ -1,8 +1,13 @@
 use qae_config::AppConfig;
-use qae_core::{ExecutionReport, OrderRequest, OrderSide, OrderStatus, OrderType, RuntimeMode};
+use qae_core::{
+    AccountBalance, ExecutionReport, FillUpdate, OrderRequest, OrderStatus, PositionUpdate,
+    PrivateStreamEvent, RuntimeMode,
+};
 use qae_market_data::MarketSnapshot;
-use qae_okx_client::{OkxClient, OkxClientError, RequestSigner, SignedRequest};
-use qae_risk::{RiskManager, RiskViolation};
+use qae_okx_client::{
+    HmacSha256Signer, OkxClient, OkxClientError, RequestSigner, ReqwestLiveOrderTransport,
+};
+use qae_risk::{PortfolioRiskManager, PortfolioRiskState, RiskManager, RiskViolation};
 use qae_time::WallClock;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -12,7 +17,6 @@ pub struct PaperExecutionEngine {
     mode: RuntimeMode,
     slippage_bps: f64,
     next_order_id: u64,
-    open_orders: BTreeMap<String, OrderRequest>,
     risk_manager: RiskManager,
 }
 
@@ -21,6 +25,10 @@ pub struct ExecutionGateway {
     mode: RuntimeMode,
     paper_engine: PaperExecutionEngine,
     okx_client: OkxClient,
+    transport: ReqwestLiveOrderTransport,
+    portfolio_risk: PortfolioRiskManager,
+    reconciliation: ReconciliationState,
+    next_live_client_order_id: u64,
 }
 
 impl ExecutionGateway {
@@ -29,6 +37,10 @@ impl ExecutionGateway {
             mode: config.mode,
             paper_engine: PaperExecutionEngine::new(config)?,
             okx_client: OkxClient::new(config.clone()),
+            transport: ReqwestLiveOrderTransport::new().map_err(ExecutionError::Okx)?,
+            portfolio_risk: PortfolioRiskManager::new(config).map_err(ExecutionError::PortfolioRiskConfig)?,
+            reconciliation: ReconciliationState::default(),
+            next_live_client_order_id: 1,
         })
     }
 
@@ -38,25 +50,127 @@ impl ExecutionGateway {
         order: OrderRequest,
         snapshot: Option<&MarketSnapshot>,
         clock: &C,
-    ) -> Result<ExecutionSubmission, ExecutionError> {
-        match self.mode {
-            RuntimeMode::Paper | RuntimeMode::Simulation => self
-                .paper_engine
-                .submit(order, snapshot)
-                .map(ExecutionSubmission::Paper),
+    ) -> Result<ExecutionReport, ExecutionError> {
+        let order = self.prepare_order(order);
+        self.portfolio_risk
+            .evaluate(&order, snapshot, &self.reconciliation.portfolio_risk)
+            .map_err(ExecutionError::PortfolioRiskRejected)?;
+
+        let report = match self.mode {
+            RuntimeMode::Paper | RuntimeMode::Simulation => self.paper_engine.submit(order.clone(), snapshot)?,
             RuntimeMode::Live => self
                 .okx_client
-                .build_signed_order_request(signer, &order, clock)
-                .map(ExecutionSubmission::Live)
-                .map_err(ExecutionError::Okx),
+                .submit_live_order(&self.transport, signer, &order, clock)
+                .map_err(ExecutionError::Okx)?,
+        };
+
+        self.reconciliation.record_submission(order, report.clone());
+        Ok(report)
+    }
+
+    pub fn apply_private_event(&mut self, event: PrivateStreamEvent) -> Option<ExecutionReport> {
+        self.reconciliation.apply_private_event(event)
+    }
+
+    #[must_use]
+    pub fn reconciliation_state(&self) -> &ReconciliationState {
+        &self.reconciliation
+    }
+
+    fn prepare_order(&mut self, order: OrderRequest) -> OrderRequest {
+        if self.mode != RuntimeMode::Live || order.client_order_id.is_some() {
+            return order;
         }
+
+        let client_order_id = format!("live-{:08}", self.next_live_client_order_id);
+        self.next_live_client_order_id += 1;
+        order.with_client_order_id(client_order_id)
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum ExecutionSubmission {
-    Paper(ExecutionReport),
-    Live(SignedRequest),
+#[derive(Debug, Clone, Default)]
+pub struct ReconciliationState {
+    pub reports: BTreeMap<String, ExecutionReport>,
+    pub reports_by_client_order_id: BTreeMap<String, String>,
+    pub balances: BTreeMap<String, AccountBalance>,
+    pub positions: BTreeMap<String, PositionUpdate>,
+    pub fills: Vec<FillUpdate>,
+    pub portfolio_risk: PortfolioRiskState,
+}
+
+impl ReconciliationState {
+    pub fn record_submission(&mut self, order: OrderRequest, report: ExecutionReport) {
+        if let Some(client_order_id) = report
+            .client_order_id
+            .clone()
+            .or(order.client_order_id.clone())
+        {
+            self.reports_by_client_order_id
+                .insert(client_order_id, report.order_id.clone());
+        }
+        self.upsert_report(report);
+    }
+
+    pub fn apply_private_event(&mut self, event: PrivateStreamEvent) -> Option<ExecutionReport> {
+        match event {
+            PrivateStreamEvent::Account(balance) => {
+                self.balances.insert(balance.currency.clone(), balance);
+                None
+            }
+            PrivateStreamEvent::Position(position) => {
+                self.portfolio_risk.apply_position_update(&position);
+                self.positions
+                    .insert(position.instrument_id.to_string(), position);
+                None
+            }
+            PrivateStreamEvent::Fill(fill) => {
+                self.portfolio_risk.apply_fill_update(&fill);
+                self.fills.push(fill.clone());
+                self.reports
+                    .get_mut(&fill.order_id)
+                    .map(|report| {
+                        report.filled_quantity += fill.fill_quantity;
+                        report.remaining_quantity = (report.remaining_quantity - fill.fill_quantity).max(0.0);
+                        report.average_fill_price = Some(fill.fill_price);
+                        report.status = if report.remaining_quantity > 0.0 {
+                            OrderStatus::PartiallyFilled
+                        } else {
+                            OrderStatus::Filled
+                        };
+                        report.clone()
+                    })
+            }
+            PrivateStreamEvent::Order(report) => {
+                self.upsert_report(report.clone());
+                Some(report)
+            }
+        }
+    }
+
+    fn upsert_report(&mut self, report: ExecutionReport) {
+        let previous_open = self
+            .reports
+            .get(&report.order_id)
+            .map(|existing| status_is_open(existing.status))
+            .unwrap_or(false);
+        let next_open = status_is_open(report.status);
+
+        if !previous_open && next_open {
+            self.portfolio_risk.open_orders = self.portfolio_risk.open_orders.saturating_add(1);
+        } else if previous_open && !next_open {
+            self.portfolio_risk.open_orders = self.portfolio_risk.open_orders.saturating_sub(1);
+        }
+
+        if let Some(client_order_id) = report.client_order_id.clone() {
+            self.reports_by_client_order_id
+                .insert(client_order_id, report.order_id.clone());
+        }
+        self.reports.insert(report.order_id.clone(), report);
+    }
+}
+
+fn status_is_open(status: OrderStatus) -> bool {
+    matches!(status, OrderStatus::Submitted | OrderStatus::Accepted | OrderStatus::PartiallyFilled)
 }
 
 impl PaperExecutionEngine {
@@ -65,7 +179,6 @@ impl PaperExecutionEngine {
             mode: config.mode,
             slippage_bps: config.execution.paper_fill_slippage_bps,
             next_order_id: 1,
-            open_orders: BTreeMap::new(),
             risk_manager: RiskManager::new(config).map_err(ExecutionError::RiskConfig)?,
         })
     }
@@ -86,35 +199,13 @@ impl PaperExecutionEngine {
         let order_id = self.allocate_order_id();
 
         match order.order_type {
-            OrderType::Market => Ok(self.filled_report(
+            qae_core::OrderType::Market => Ok(self.filled_report(
                 order,
                 order_id,
                 apply_slippage(approval.reference_price, approval.side, self.slippage_bps),
             )),
-            OrderType::Limit => self.submit_limit(order, order_id, snapshot),
+            qae_core::OrderType::Limit => self.submit_limit(order, order_id, snapshot),
         }
-    }
-
-    #[must_use]
-    pub fn open_order_count(&self) -> usize {
-        self.open_orders.len()
-    }
-
-    pub fn cancel(&mut self, order_id: &str) -> Option<ExecutionReport> {
-        self.open_orders.remove(order_id).map(|order| {
-            let remaining_quantity = order.quantity;
-            let instrument_id = order.instrument_id;
-
-            ExecutionReport {
-                order_id: order_id.to_string(),
-                instrument_id,
-                status: OrderStatus::Cancelled,
-                filled_quantity: 0.0,
-                remaining_quantity,
-                average_fill_price: None,
-                rejection_reason: None,
-            }
-        })
     }
 
     fn submit_limit(
@@ -132,27 +223,26 @@ impl PaperExecutionEngine {
             .ok_or(ExecutionError::MarketDataUnavailable)?;
 
         let is_crossing = match order.side {
-            OrderSide::Buy => limit_price >= reference_price,
-            OrderSide::Sell => limit_price <= reference_price,
+            qae_core::OrderSide::Buy => limit_price >= reference_price,
+            qae_core::OrderSide::Sell => limit_price <= reference_price,
         };
 
         if is_crossing {
             let fill_price = match order.side {
-                OrderSide::Buy => reference_price.min(limit_price),
-                OrderSide::Sell => reference_price.max(limit_price),
+                qae_core::OrderSide::Buy => reference_price.min(limit_price),
+                qae_core::OrderSide::Sell => reference_price.max(limit_price),
             };
 
             Ok(self.filled_report(order, order_id, fill_price))
         } else {
-            self.open_orders.insert(order_id.clone(), order.clone());
-            let remaining_quantity = order.quantity;
-            let instrument_id = order.instrument_id;
             Ok(ExecutionReport {
                 order_id,
-                instrument_id,
+                client_order_id: order.client_order_id.clone(),
+                venue_order_id: None,
+                instrument_id: order.instrument_id,
                 status: OrderStatus::Accepted,
                 filled_quantity: 0.0,
-                remaining_quantity,
+                remaining_quantity: order.quantity,
                 average_fill_price: None,
                 rejection_reason: None,
             })
@@ -165,14 +255,13 @@ impl PaperExecutionEngine {
         order_id: String,
         fill_price: f64,
     ) -> ExecutionReport {
-        let filled_quantity = order.quantity;
-        let instrument_id = order.instrument_id;
-
         ExecutionReport {
             order_id,
-            instrument_id,
+            client_order_id: order.client_order_id,
+            venue_order_id: None,
+            instrument_id: order.instrument_id,
             status: OrderStatus::Filled,
-            filled_quantity,
+            filled_quantity: order.quantity,
             remaining_quantity: 0.0,
             average_fill_price: Some(fill_price),
             rejection_reason: None,
@@ -186,9 +275,9 @@ impl PaperExecutionEngine {
     }
 }
 
-fn apply_slippage(reference_price: f64, side: OrderSide, slippage_bps: f64) -> f64 {
+fn apply_slippage(reference_price: f64, side: qae_core::OrderSide, slippage_bps: f64) -> f64 {
     let multiplier = slippage_bps / 10_000.0;
-    if side == OrderSide::Buy {
+    if side == qae_core::OrderSide::Buy {
         reference_price * (1.0 + multiplier)
     } else {
         (reference_price * (1.0 - multiplier)).max(0.0)
@@ -201,11 +290,15 @@ pub enum ExecutionError {
     LiveExecutionUnsupported,
     #[error("market data is unavailable for execution")]
     MarketDataUnavailable,
-    #[error("order rejected by risk checks: {0}")]
+    #[error("order rejected by per-order risk checks: {0}")]
     RiskRejected(#[from] RiskViolation),
-    #[error("failed to build risk manager: {0}")]
+    #[error("failed to build per-order risk manager: {0}")]
     RiskConfig(#[source] qae_risk::RiskError),
-    #[error("failed to build OKX submission: {0}")]
+    #[error("order rejected by portfolio risk checks: {0}")]
+    PortfolioRiskRejected(#[source] RiskViolation),
+    #[error("failed to build portfolio risk manager: {0}")]
+    PortfolioRiskConfig(#[source] qae_risk::RiskError),
+    #[error("failed to interact with OKX client: {0}")]
     Okx(#[from] OkxClientError),
 }
 
@@ -213,10 +306,9 @@ pub enum ExecutionError {
 mod tests {
     use super::*;
     use chrono::{DateTime, TimeZone, Utc};
-    use qae_core::{InstrumentId, OrderRequest, OrderType};
+    use qae_core::{InstrumentId, OrderRequest, OrderSide, OrderType};
     use qae_market_data::{MarketSnapshot, OrderBookLevel, OrderBookSnapshot, Ticker};
-    use qae_okx_client::HmacSha256Signer;
-    use qae_time::{ExchangeTimestamp, WallClock};
+    use qae_time::ExchangeTimestamp;
 
     struct FixedClock(DateTime<Utc>);
 
@@ -263,9 +355,7 @@ mod tests {
         )
         .expect("order");
 
-        let report = engine
-            .submit(order, Some(&sample_snapshot()))
-            .expect("report");
+        let report = engine.submit(order, Some(&sample_snapshot())).expect("report");
 
         assert_eq!(report.status, OrderStatus::Filled);
         assert_eq!(report.average_fill_price, Some(100.5201));
@@ -284,12 +374,9 @@ mod tests {
         .and_then(|order| order.with_limit_price(99.0))
         .expect("order");
 
-        let report = engine
-            .submit(order, Some(&sample_snapshot()))
-            .expect("report");
+        let report = engine.submit(order, Some(&sample_snapshot())).expect("report");
 
         assert_eq!(report.status, OrderStatus::Accepted);
-        assert_eq!(engine.open_order_count(), 1);
     }
 
     #[test]
@@ -305,16 +392,14 @@ mod tests {
         .and_then(|order| order.with_limit_price(99.0))
         .expect("order");
 
-        let report = engine
-            .submit(order, Some(&sample_snapshot()))
-            .expect("report");
+        let report = engine.submit(order, Some(&sample_snapshot())).expect("report");
 
         assert_eq!(report.status, OrderStatus::Filled);
         assert_eq!(report.average_fill_price, Some(99.5));
     }
 
     #[test]
-    fn live_mode_stays_disabled() {
+    fn live_mode_stays_disabled_for_paper_engine() {
         let mut config = AppConfig {
             mode: RuntimeMode::Live,
             live_trading: true,
@@ -324,8 +409,7 @@ mod tests {
         config.okx.credentials.api_secret = Some("s".to_string());
         config.okx.credentials.passphrase = Some("p".to_string());
 
-        let engine = PaperExecutionEngine::new(&config).expect("engine");
-        let mut engine = engine;
+        let mut engine = PaperExecutionEngine::new(&config).expect("engine");
         let order = OrderRequest::new(
             InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
             OrderSide::Buy,
@@ -341,35 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_gateway_routes_paper_mode_to_fill_reports() {
-        let config = AppConfig::default();
-        let mut gateway = ExecutionGateway::new(&config).expect("gateway");
-        let order = OrderRequest::new(
-            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
-            OrderSide::Buy,
-            OrderType::Market,
-            1.0,
-        )
-        .expect("order");
-
-        let submission = gateway
-            .submit(
-                &HmacSha256Signer,
-                order,
-                Some(&sample_snapshot()),
-                &FixedClock(
-                    Utc.timestamp_millis_opt(1_700_000_000_000)
-                        .single()
-                        .expect("ts"),
-                ),
-            )
-            .expect("submission");
-
-        assert!(matches!(submission, ExecutionSubmission::Paper(_)));
-    }
-
-    #[test]
-    fn execution_gateway_routes_live_mode_to_signed_requests() {
+    fn execution_gateway_assigns_client_order_ids_for_live_orders() {
         let mut config = AppConfig {
             mode: RuntimeMode::Live,
             live_trading: true,
@@ -389,25 +445,60 @@ mod tests {
         .and_then(|order| order.with_limit_price(101.0))
         .expect("order");
 
-        let submission = gateway
-            .submit(
-                &HmacSha256Signer,
-                order,
-                None,
-                &FixedClock(
-                    Utc.timestamp_millis_opt(1_700_000_000_000)
-                        .single()
-                        .expect("ts"),
-                ),
-            )
-            .expect("submission");
+        let result = gateway.submit(
+            &HmacSha256Signer,
+            order,
+            Some(&sample_snapshot()),
+            &FixedClock(
+                Utc.timestamp_millis_opt(1_700_000_000_000)
+                    .single()
+                    .expect("ts"),
+            ),
+        );
 
-        match submission {
-            ExecutionSubmission::Live(request) => {
-                assert_eq!(request.request.path, qae_okx_client::OKX_ORDER_PATH);
-                assert!(request.request.body.contains(r#""instId":"BTC-USDT-SWAP""#));
-            }
-            ExecutionSubmission::Paper(_) => panic!("expected live request"),
-        }
+        assert!(result.is_err());
+        // transport is real and not exercised in unit tests, but id allocation occurs before I/O.
+        assert_eq!(gateway.next_live_client_order_id, 2);
+    }
+
+    #[test]
+    fn reconciliation_updates_from_private_events() {
+        let mut reconciliation = ReconciliationState::default();
+        let report = ExecutionReport {
+            order_id: "ord-1".to_string(),
+            client_order_id: Some("cid-1".to_string()),
+            venue_order_id: Some("venue-1".to_string()),
+            instrument_id: InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+            status: OrderStatus::Accepted,
+            filled_quantity: 0.0,
+            remaining_quantity: 2.0,
+            average_fill_price: None,
+            rejection_reason: None,
+        };
+        let order = OrderRequest::new(
+            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            2.0,
+        )
+        .and_then(|order| order.with_limit_price(100.0))
+        .expect("order")
+        .with_client_order_id("cid-1");
+        reconciliation.record_submission(order, report);
+
+        let updated = reconciliation
+            .apply_private_event(PrivateStreamEvent::Fill(FillUpdate {
+                order_id: "ord-1".to_string(),
+                client_order_id: Some("cid-1".to_string()),
+                instrument_id: InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+                side: OrderSide::Buy,
+                fill_price: 100.0,
+                fill_quantity: 2.0,
+            }))
+            .is_some();
+
+        assert!(!updated);
+        assert_eq!(reconciliation.fills.len(), 1);
+        assert_eq!(reconciliation.reports["ord-1"].status, OrderStatus::Filled);
     }
 }

@@ -192,7 +192,9 @@ pub enum OrderRequestError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderStatus {
+    Submitted,
     Accepted,
+    PartiallyFilled,
     Filled,
     Rejected,
     Cancelled,
@@ -201,12 +203,48 @@ pub enum OrderStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionReport {
     pub order_id: String,
+    pub client_order_id: Option<String>,
+    pub venue_order_id: Option<String>,
     pub instrument_id: InstrumentId,
     pub status: OrderStatus,
     pub filled_quantity: f64,
     pub remaining_quantity: f64,
     pub average_fill_price: Option<f64>,
     pub rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountBalance {
+    pub currency: String,
+    pub equity: f64,
+    pub available_equity: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionUpdate {
+    pub instrument_id: InstrumentId,
+    pub side: OrderSide,
+    pub quantity: f64,
+    pub average_entry_price: Option<f64>,
+    pub unrealized_pnl: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillUpdate {
+    pub order_id: String,
+    pub client_order_id: Option<String>,
+    pub instrument_id: InstrumentId,
+    pub side: OrderSide,
+    pub fill_price: f64,
+    pub fill_quantity: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PrivateStreamEvent {
+    Account(AccountBalance),
+    Order(ExecutionReport),
+    Position(PositionUpdate),
+    Fill(FillUpdate),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

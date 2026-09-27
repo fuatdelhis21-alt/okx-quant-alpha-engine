@@ -158,6 +158,23 @@ impl AppConfig {
             self.risk.max_price_deviation_bps = parse_f64("RISK_MAX_PRICE_DEVIATION_BPS", value)?;
         }
 
+        if let Some(value) = map.get("RISK_MAX_POSITION_NOTIONAL") {
+            self.risk.max_position_notional = parse_f64("RISK_MAX_POSITION_NOTIONAL", value)?;
+        }
+
+        if let Some(value) = map.get("RISK_MAX_TOTAL_EXPOSURE_NOTIONAL") {
+            self.risk.max_total_exposure_notional =
+                parse_f64("RISK_MAX_TOTAL_EXPOSURE_NOTIONAL", value)?;
+        }
+
+        if let Some(value) = map.get("RISK_MAX_DAILY_LOSS") {
+            self.risk.max_daily_loss = parse_f64("RISK_MAX_DAILY_LOSS", value)?;
+        }
+
+        if let Some(value) = map.get("RISK_MAX_OPEN_ORDERS") {
+            self.risk.max_open_orders = parse_u32("RISK_MAX_OPEN_ORDERS", value)?;
+        }
+
         if let Some(value) = map.get("PAPER_STARTING_BALANCE_USDT") {
             self.execution.paper_starting_balance_usdt =
                 parse_f64("PAPER_STARTING_BALANCE_USDT", value)?;
@@ -234,6 +251,15 @@ impl AppConfig {
                 self.risk.max_price_deviation_bps,
             ),
             (
+                "RISK_MAX_POSITION_NOTIONAL",
+                self.risk.max_position_notional,
+            ),
+            (
+                "RISK_MAX_TOTAL_EXPOSURE_NOTIONAL",
+                self.risk.max_total_exposure_notional,
+            ),
+            ("RISK_MAX_DAILY_LOSS", self.risk.max_daily_loss),
+            (
                 "PAPER_STARTING_BALANCE_USDT",
                 self.execution.paper_starting_balance_usdt,
             ),
@@ -253,6 +279,13 @@ impl AppConfig {
             return Err(ConfigError::InvalidValue {
                 name: "PAPER_FILL_SLIPPAGE_BPS",
                 value: self.execution.paper_fill_slippage_bps.to_string(),
+            });
+        }
+
+        if self.risk.max_open_orders == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "RISK_MAX_OPEN_ORDERS",
+                value: self.risk.max_open_orders.to_string(),
             });
         }
 
@@ -353,6 +386,18 @@ impl AppConfig {
             }
             if let Some(max_price_deviation_bps) = risk.max_price_deviation_bps {
                 self.risk.max_price_deviation_bps = max_price_deviation_bps;
+            }
+            if let Some(max_position_notional) = risk.max_position_notional {
+                self.risk.max_position_notional = max_position_notional;
+            }
+            if let Some(max_total_exposure_notional) = risk.max_total_exposure_notional {
+                self.risk.max_total_exposure_notional = max_total_exposure_notional;
+            }
+            if let Some(max_daily_loss) = risk.max_daily_loss {
+                self.risk.max_daily_loss = max_daily_loss;
+            }
+            if let Some(max_open_orders) = risk.max_open_orders {
+                self.risk.max_open_orders = max_open_orders;
             }
         }
 
@@ -489,6 +534,10 @@ pub struct RiskConfig {
     pub max_order_quantity: f64,
     pub max_order_notional: f64,
     pub max_price_deviation_bps: f64,
+    pub max_position_notional: f64,
+    pub max_total_exposure_notional: f64,
+    pub max_daily_loss: f64,
+    pub max_open_orders: u32,
 }
 
 impl Default for RiskConfig {
@@ -497,6 +546,10 @@ impl Default for RiskConfig {
             max_order_quantity: 5.0,
             max_order_notional: 100_000.0,
             max_price_deviation_bps: 500.0,
+            max_position_notional: 200_000.0,
+            max_total_exposure_notional: 500_000.0,
+            max_daily_loss: 25_000.0,
+            max_open_orders: 20,
         }
     }
 }
@@ -656,6 +709,10 @@ struct TomlRiskConfig {
     max_order_quantity: Option<f64>,
     max_order_notional: Option<f64>,
     max_price_deviation_bps: Option<f64>,
+    max_position_notional: Option<f64>,
+    max_total_exposure_notional: Option<f64>,
+    max_daily_loss: Option<f64>,
+    max_open_orders: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -681,6 +738,7 @@ mod tests {
         );
         assert!(!cfg.market_data.connect_public_stream_on_startup);
         assert!(!cfg.market_data.connect_private_stream_on_startup);
+        assert_eq!(cfg.risk.max_open_orders, 20);
     }
 
     #[test]
@@ -747,6 +805,7 @@ mod tests {
         cfg.apply_env_overrides(vec![
             ("MARKET_DATA_INSTRUMENTS", "BTC-USDT-SWAP,ETH-USDT-SWAP"),
             ("RISK_MAX_ORDER_NOTIONAL", "25000"),
+            ("RISK_MAX_OPEN_ORDERS", "5"),
             ("CONNECT_PUBLIC_STREAM_ON_STARTUP", "true"),
             ("CONNECT_PRIVATE_STREAM_ON_STARTUP", "true"),
         ])
@@ -757,6 +816,7 @@ mod tests {
             vec!["BTC-USDT-SWAP".to_string(), "ETH-USDT-SWAP".to_string()]
         );
         assert_eq!(cfg.risk.max_order_notional, 25_000.0);
+        assert_eq!(cfg.risk.max_open_orders, 5);
         assert!(cfg.market_data.connect_public_stream_on_startup);
         assert!(cfg.market_data.connect_private_stream_on_startup);
     }
@@ -810,6 +870,20 @@ mod tests {
             cfg.validate(),
             Err(ConfigError::InvalidValue {
                 name: "PAPER_FILL_SLIPPAGE_BPS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_zero_open_order_limit() {
+        let mut cfg = AppConfig::default();
+        cfg.risk.max_open_orders = 0;
+
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                name: "RISK_MAX_OPEN_ORDERS",
                 ..
             })
         ));
