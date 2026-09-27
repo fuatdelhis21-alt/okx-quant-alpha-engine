@@ -1,3 +1,4 @@
+use crc32fast::hash;
 use futures_util::{SinkExt, StreamExt};
 use qae_config::AppConfig;
 use qae_core::{InstrumentId, RuntimeMode};
@@ -135,6 +136,7 @@ pub struct WebsocketEngine {
     pub health: WsHealthMetrics,
     subscriptions: Vec<MarketDataSubscription>,
     snapshots: HashMap<InstrumentId, MarketSnapshot>,
+    book_states: HashMap<InstrumentId, OrderBookState>,
     order_book_depth: u32,
     _send_tx: mpsc::Sender<String>,
     _send_rx: mpsc::Receiver<String>,
@@ -160,6 +162,7 @@ impl WebsocketEngine {
             health: WsHealthMetrics::default(),
             subscriptions,
             snapshots: HashMap::new(),
+            book_states: HashMap::new(),
             order_book_depth: config.market_data.order_book_depth,
             _send_tx: send_tx,
             _send_rx: send_rx,
@@ -224,6 +227,32 @@ impl WebsocketEngine {
         Ok(updates)
     }
 
+    pub async fn connect_private_stream(
+        &mut self,
+        endpoint: &str,
+        login_command: &str,
+        max_duration: Duration,
+    ) -> Result<(), WebsocketEngineError> {
+        if max_duration.is_zero() {
+            self.state = ConnectionState::Stopped;
+            return Ok(());
+        }
+
+        self.begin_connecting();
+
+        let (mut socket, _) = connect_async(endpoint)
+            .await
+            .map_err(|source| self.register_transport_error(source))?;
+
+        self.mark_connected();
+        self.send_commands(&mut socket, [login_command.to_string()])
+            .await?;
+        self.await_private_login(&mut socket, max_duration).await?;
+        self.state = ConnectionState::Stopped;
+
+        Ok(())
+    }
+
     pub fn ingest_text_frame(
         &mut self,
         payload: &str,
@@ -242,19 +271,22 @@ impl WebsocketEngine {
         let instrument_id = InstrumentId::new(inst_id.clone())
             .map_err(|_| WebsocketEngineError::InvalidInstrument(inst_id))?;
         let channel = arg.channel;
+        let action = frame.action.as_deref();
         let mut updates = Vec::new();
 
         for entry in frame.data.unwrap_or_default() {
-            let update = match channel.as_str() {
-                "tickers" => MarketDataUpdate::Ticker(parse_ticker(&instrument_id, entry)?),
+            match channel.as_str() {
+                "tickers" => {
+                    let update = MarketDataUpdate::Ticker(parse_ticker(&instrument_id, entry)?);
+                    self.apply_update(update.clone());
+                    updates.push(update);
+                }
                 "books" | "books5" => {
-                    MarketDataUpdate::OrderBook(parse_order_book(&instrument_id, entry)?)
+                    let snapshot = self.ingest_order_book_frame(&instrument_id, action, entry)?;
+                    updates.push(MarketDataUpdate::OrderBook(snapshot));
                 }
                 other => return Err(WebsocketEngineError::UnsupportedChannel(other.to_string())),
-            };
-
-            self.apply_update(update.clone());
-            updates.push(update);
+            }
         }
 
         Ok(updates)
@@ -283,9 +315,22 @@ impl WebsocketEngine {
     where
         S: futures_util::Sink<Message, Error = TungsteniteError> + Unpin,
     {
-        for request in self.subscription_requests() {
+        self.send_commands(socket, self.subscription_requests())
+            .await
+    }
+
+    async fn send_commands<S, I>(
+        &mut self,
+        socket: &mut S,
+        commands: I,
+    ) -> Result<(), WebsocketEngineError>
+    where
+        S: futures_util::Sink<Message, Error = TungsteniteError> + Unpin,
+        I: IntoIterator<Item = String>,
+    {
+        for command in commands {
             socket
-                .send(Message::Text(request.into()))
+                .send(Message::Text(command.into()))
                 .await
                 .map_err(|source| self.register_transport_error(source))?;
         }
@@ -365,6 +410,109 @@ impl WebsocketEngine {
         Ok(updates)
     }
 
+    async fn await_private_login<S>(
+        &mut self,
+        socket: &mut S,
+        max_duration: Duration,
+    ) -> Result<(), WebsocketEngineError>
+    where
+        S: futures_util::Stream<Item = Result<Message, TungsteniteError>>
+            + futures_util::Sink<Message, Error = TungsteniteError>
+            + Unpin,
+    {
+        let deadline = time::Instant::now() + max_duration;
+
+        loop {
+            let now = time::Instant::now();
+            if now >= deadline {
+                let error = WebsocketEngineError::LoginTimedOut;
+                self.register_disconnect(error.to_string());
+                return Err(error);
+            }
+
+            let wait_for = deadline.saturating_duration_since(now);
+            match time::timeout(wait_for, socket.next()).await {
+                Ok(Some(Ok(Message::Text(payload)))) => {
+                    let frame: ControlFrame = serde_json::from_str(payload.as_str())
+                        .map_err(|source| WebsocketEngineError::InvalidFrame(source.to_string()))?;
+                    if frame.event.as_deref() == Some("login") {
+                        let accepted = frame.code.as_deref().unwrap_or("0") == "0";
+                        if accepted {
+                            return Ok(());
+                        }
+
+                        return Err(WebsocketEngineError::ControlRejected(
+                            frame.msg.unwrap_or_else(|| "login rejected".to_string()),
+                        ));
+                    }
+                }
+                Ok(Some(Ok(Message::Ping(payload)))) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|source| self.register_transport_error(source))?;
+                }
+                Ok(Some(Ok(Message::Pong(_))))
+                | Ok(Some(Ok(Message::Binary(_))))
+                | Ok(Some(Ok(Message::Frame(_)))) => {}
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+                    let error = WebsocketEngineError::LoginTimedOut;
+                    self.register_disconnect(error.to_string());
+                    return Err(error);
+                }
+                Ok(Some(Err(source))) => return Err(self.register_transport_error(source)),
+                Err(_) => {
+                    let error = WebsocketEngineError::LoginTimedOut;
+                    self.register_disconnect(error.to_string());
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn ingest_order_book_frame(
+        &mut self,
+        instrument_id: &InstrumentId,
+        action: Option<&str>,
+        value: serde_json::Value,
+    ) -> Result<OrderBookSnapshot, WebsocketEngineError> {
+        let payload: OrderBookPayload = serde_json::from_value(value)
+            .map_err(|source| WebsocketEngineError::InvalidFrame(source.to_string()))?;
+        let ts = parse_i64(&payload.ts)?;
+        let checksum = payload.checksum.as_deref().map(parse_i64).transpose()?;
+        let bids = parse_raw_levels(payload.bids)?;
+        let asks = parse_raw_levels(payload.asks)?;
+
+        let mut next_state = self
+            .book_states
+            .get(instrument_id)
+            .cloned()
+            .unwrap_or_default();
+        match action.unwrap_or("snapshot") {
+            "snapshot" => next_state.replace(bids, asks, checksum),
+            "update" => next_state.apply_update(bids, asks, checksum),
+            other => return Err(WebsocketEngineError::UnsupportedAction(other.to_string())),
+        }
+
+        if let Some(expected) = checksum {
+            let actual = next_state.checksum_value();
+            if actual != expected {
+                return Err(WebsocketEngineError::ChecksumMismatch { expected, actual });
+            }
+        }
+
+        let snapshot = next_state
+            .to_snapshot(instrument_id.clone(), ExchangeTimestamp::from_millis(ts))
+            .map_err(WebsocketEngineError::MarketData)?;
+        self.book_states.insert(instrument_id.clone(), next_state);
+        self.snapshots
+            .entry(instrument_id.clone())
+            .or_default()
+            .order_book = Some(snapshot.clone());
+
+        Ok(snapshot)
+    }
+
     fn apply_update(&mut self, update: MarketDataUpdate) {
         match update {
             MarketDataUpdate::Ticker(ticker) => {
@@ -430,46 +578,6 @@ fn parse_ticker(
     .map_err(WebsocketEngineError::MarketData)
 }
 
-fn parse_order_book(
-    instrument_id: &InstrumentId,
-    value: serde_json::Value,
-) -> Result<OrderBookSnapshot, WebsocketEngineError> {
-    let payload: OrderBookPayload = serde_json::from_value(value)
-        .map_err(|source| WebsocketEngineError::InvalidFrame(source.to_string()))?;
-    let ts = parse_i64(&payload.ts)?;
-    let bids = payload
-        .bids
-        .into_iter()
-        .map(|level| {
-            let price = parse_f64(&level.0)?;
-            let quantity = parse_f64(&level.1)?;
-            OrderBookLevel::new(price, quantity).map_err(WebsocketEngineError::MarketData)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let asks = payload
-        .asks
-        .into_iter()
-        .map(|level| {
-            let price = parse_f64(&level.0)?;
-            let quantity = parse_f64(&level.1)?;
-            OrderBookLevel::new(price, quantity).map_err(WebsocketEngineError::MarketData)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let checksum = payload
-        .checksum
-        .map(|value| parse_i64(&value))
-        .transpose()?;
-
-    OrderBookSnapshot::new(
-        instrument_id.clone(),
-        bids,
-        asks,
-        checksum,
-        ExchangeTimestamp::from_millis(ts),
-    )
-    .map_err(WebsocketEngineError::MarketData)
-}
-
 fn parse_f64(value: &str) -> Result<f64, WebsocketEngineError> {
     f64::from_str(value).map_err(|_| WebsocketEngineError::InvalidNumber(value.to_string()))
 }
@@ -481,6 +589,7 @@ fn parse_i64(value: &str) -> Result<i64, WebsocketEngineError> {
 #[derive(Debug, Deserialize)]
 struct IncomingFrame {
     event: Option<String>,
+    action: Option<String>,
     arg: Option<FrameArg>,
     data: Option<Vec<serde_json::Value>>,
 }
@@ -490,6 +599,13 @@ struct FrameArg {
     channel: String,
     #[serde(rename = "instId")]
     inst_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlFrame {
+    event: Option<String>,
+    code: Option<String>,
+    msg: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -525,12 +641,160 @@ struct OrderBookPayload {
 
 type RawOrderBookLevel = (String, String, IgnoredAny, IgnoredAny);
 
+#[derive(Debug, Clone, Default)]
+struct OrderBookState {
+    bids: Vec<RawBookLevelState>,
+    asks: Vec<RawBookLevelState>,
+    checksum: Option<i64>,
+}
+
+impl OrderBookState {
+    fn replace(
+        &mut self,
+        bids: Vec<RawBookLevelState>,
+        asks: Vec<RawBookLevelState>,
+        checksum: Option<i64>,
+    ) {
+        self.bids = bids;
+        self.asks = asks;
+        self.checksum = checksum;
+        sort_bid_levels(&mut self.bids);
+        sort_ask_levels(&mut self.asks);
+    }
+
+    fn apply_update(
+        &mut self,
+        bid_updates: Vec<RawBookLevelState>,
+        ask_updates: Vec<RawBookLevelState>,
+        checksum: Option<i64>,
+    ) {
+        apply_side_updates(&mut self.bids, bid_updates, true);
+        apply_side_updates(&mut self.asks, ask_updates, false);
+        self.checksum = checksum;
+    }
+
+    fn checksum_value(&self) -> i64 {
+        let pair_count = self.bids.len().max(self.asks.len()).min(25);
+        let mut entries = Vec::new();
+
+        for index in 0..pair_count {
+            if let Some(level) = self.bids.get(index) {
+                entries.push(level.price_text.as_str());
+                entries.push(level.quantity_text.as_str());
+            }
+            if let Some(level) = self.asks.get(index) {
+                entries.push(level.price_text.as_str());
+                entries.push(level.quantity_text.as_str());
+            }
+        }
+
+        i64::from(hash(entries.join(":").as_bytes()) as i32)
+    }
+
+    fn to_snapshot(
+        &self,
+        instrument_id: InstrumentId,
+        ts: ExchangeTimestamp,
+    ) -> Result<OrderBookSnapshot, MarketDataError> {
+        let bids = self
+            .bids
+            .iter()
+            .map(RawBookLevelState::to_public_level)
+            .collect::<Result<Vec<_>, _>>()?;
+        let asks = self
+            .asks
+            .iter()
+            .map(RawBookLevelState::to_public_level)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        OrderBookSnapshot::new(instrument_id, bids, asks, self.checksum, ts)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawBookLevelState {
+    price_text: String,
+    quantity_text: String,
+    price: f64,
+    quantity: f64,
+}
+
+impl RawBookLevelState {
+    fn parse(level: RawOrderBookLevel) -> Result<Self, WebsocketEngineError> {
+        let price = parse_f64(&level.0)?;
+        let quantity = parse_f64(&level.1)?;
+        if price <= 0.0 {
+            return Err(WebsocketEngineError::InvalidNumber(level.0));
+        }
+        if quantity < 0.0 {
+            return Err(WebsocketEngineError::InvalidNumber(level.1));
+        }
+
+        Ok(Self {
+            price_text: level.0,
+            quantity_text: level.1,
+            price,
+            quantity,
+        })
+    }
+
+    fn to_public_level(&self) -> Result<OrderBookLevel, MarketDataError> {
+        OrderBookLevel::new(self.price, self.quantity)
+    }
+}
+
+fn parse_raw_levels(
+    levels: Vec<RawOrderBookLevel>,
+) -> Result<Vec<RawBookLevelState>, WebsocketEngineError> {
+    levels
+        .into_iter()
+        .map(RawBookLevelState::parse)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn apply_side_updates(
+    levels: &mut Vec<RawBookLevelState>,
+    updates: Vec<RawBookLevelState>,
+    descending: bool,
+) {
+    for update in updates {
+        if let Some(index) = levels
+            .iter()
+            .position(|level| level.price_text == update.price_text)
+        {
+            if update.quantity == 0.0 {
+                levels.remove(index);
+            } else {
+                levels[index] = update;
+            }
+        } else if update.quantity > 0.0 {
+            levels.push(update);
+        }
+    }
+
+    if descending {
+        sort_bid_levels(levels);
+    } else {
+        sort_ask_levels(levels);
+    }
+}
+
+fn sort_bid_levels(levels: &mut [RawBookLevelState]) {
+    levels.sort_by(|left, right| right.price.total_cmp(&left.price));
+}
+
+fn sort_ask_levels(levels: &mut [RawBookLevelState]) {
+    levels.sort_by(|left, right| left.price.total_cmp(&right.price));
+}
+
 #[derive(Debug, Error)]
 pub enum WebsocketEngineError {
     #[error("live mode guard rejected websocket engine startup")]
     LiveModeGuard,
     #[error("unsupported websocket channel: {0}")]
     UnsupportedChannel(String),
+    #[error("unsupported websocket action: {0}")]
+    UnsupportedAction(String),
     #[error("invalid websocket frame: {0}")]
     InvalidFrame(String),
     #[error("websocket frame is missing arg")]
@@ -541,6 +805,12 @@ pub enum WebsocketEngineError {
     InvalidNumber(String),
     #[error("invalid instrument id: {0}")]
     InvalidInstrument(String),
+    #[error("order book checksum mismatch: expected {expected}, got {actual}")]
+    ChecksumMismatch { expected: i64, actual: i64 },
+    #[error("private websocket control rejected: {0}")]
+    ControlRejected(String),
+    #[error("private websocket login timed out")]
+    LoginTimedOut,
     #[error("websocket transport failed: {0}")]
     Transport(String),
     #[error("websocket heartbeat timed out")]
@@ -616,7 +886,7 @@ mod tests {
         let mut engine = WebsocketEngine::new(&cfg).expect("engine");
         engine
             .ingest_text_frame(
-                r#"{"arg":{"channel":"books5","instId":"BTC-USDT-SWAP"},"data":[{"asks":[["101.5","2.0","0","1"]],"bids":[["101.0","1.5","0","1"]],"ts":"1700000000001","checksum":"7"}]}"#,
+                r#"{"arg":{"channel":"books5","instId":"BTC-USDT-SWAP"},"data":[{"asks":[["101.5","2.0","0","1"]],"bids":[["101.0","1.5","0","1"]],"ts":"1700000000001"}]}"#,
             )
             .expect("book frame");
 
@@ -631,6 +901,58 @@ mod tests {
                 .map(|level| level.price),
             Some(101.5)
         );
+    }
+
+    #[test]
+    fn applies_incremental_order_book_updates() {
+        let cfg = AppConfig::default();
+        let mut engine = WebsocketEngine::new(&cfg).expect("engine");
+        engine
+            .ingest_text_frame(
+                r#"{"arg":{"channel":"books5","instId":"BTC-USDT-SWAP"},"action":"snapshot","data":[{"asks":[["101.5","2.0","0","1"]],"bids":[["101.0","1.5","0","1"]],"ts":"1700000000001"}]}"#,
+            )
+            .expect("snapshot");
+
+        engine
+            .ingest_text_frame(
+                r#"{"arg":{"channel":"books5","instId":"BTC-USDT-SWAP"},"action":"update","data":[{"asks":[["101.5","0","0","1"],["102.0","3.0","0","1"]],"bids":[["101.2","2.5","0","1"]],"ts":"1700000000002"}]}"#,
+            )
+            .expect("update");
+
+        let snapshot = engine
+            .latest_snapshot(&InstrumentId::new("BTC-USDT-SWAP").expect("instrument"))
+            .expect("snapshot");
+        assert_eq!(
+            snapshot
+                .order_book
+                .as_ref()
+                .and_then(|book| book.best_bid())
+                .map(|level| level.price),
+            Some(101.2)
+        );
+        assert_eq!(
+            snapshot
+                .order_book
+                .as_ref()
+                .and_then(|book| book.best_ask())
+                .map(|level| level.price),
+            Some(102.0)
+        );
+    }
+
+    #[test]
+    fn rejects_order_book_frames_with_bad_checksum() {
+        let cfg = AppConfig::default();
+        let mut engine = WebsocketEngine::new(&cfg).expect("engine");
+
+        let result = engine.ingest_text_frame(
+            r#"{"arg":{"channel":"books5","instId":"BTC-USDT-SWAP"},"action":"snapshot","data":[{"asks":[["101.5","2.0","0","1"]],"bids":[["101.0","1.5","0","1"]],"ts":"1700000000001","checksum":"7"}]}"#,
+        );
+
+        assert!(matches!(
+            result,
+            Err(WebsocketEngineError::ChecksumMismatch { .. })
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -666,7 +988,7 @@ mod tests {
                 .expect("ticker");
             socket
                 .send(Message::Text(
-                    r#"{"arg":{"channel":"books5","instId":"BTC-USDT-SWAP"},"data":[{"asks":[["101.5","2.0","0","1"]],"bids":[["101.0","1.5","0","1"]],"ts":"1700000000001","checksum":"7"}]}"#
+                    r#"{"arg":{"channel":"books5","instId":"BTC-USDT-SWAP"},"data":[{"asks":[["101.5","2.0","0","1"]],"bids":[["101.0","1.5","0","1"]],"ts":"1700000000001"}]}"#
                         .into(),
                 ))
                 .await
@@ -683,6 +1005,46 @@ mod tests {
         assert_eq!(updates.len(), 2);
         assert_eq!(engine.state, ConnectionState::Stopped);
 
+        server.await.expect("server");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connects_to_local_server_and_authenticates_private_login() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut socket = accept_async(stream).await.expect("handshake");
+
+            let first_message = socket
+                .next()
+                .await
+                .expect("message")
+                .expect("socket message");
+            let payload = first_message.into_text().expect("text");
+            assert!(payload.contains(r#""op":"login""#));
+
+            socket
+                .send(Message::Text(
+                    r#"{"event":"login","code":"0","msg":""}"#.into(),
+                ))
+                .await
+                .expect("ack");
+        });
+
+        let cfg = AppConfig::default();
+        let mut engine = WebsocketEngine::new(&cfg).expect("engine");
+        engine
+            .connect_private_stream(
+                &format!("ws://{addr}"),
+                r#"{"op":"login","args":[{"apiKey":"k"}]}"#,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("login");
+
+        assert_eq!(engine.state, ConnectionState::Stopped);
         server.await.expect("server");
     }
 }

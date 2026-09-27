@@ -8,9 +8,9 @@
 4. Structured tracing setup and secret-redaction conventions.
 5. Time abstractions for wall-clock, exchange timestamps, and monotonic elapsed measurements.
 6. OKX request/signing foundation with endpoint selection and demo-trading header handling.
-7. WebSocket engine scaffolding with bounded channels, reconnect backoff, heartbeat supervision, subscription planning, OKX frame parsing, market snapshot caching, and a short-lived public stream runtime path.
+7. WebSocket engine scaffolding with bounded channels, reconnect backoff, heartbeat supervision, subscription planning, OKX frame parsing, incremental order-book merge/checksum handling, market snapshot caching, and short-lived public/private startup runtime paths.
 8. Risk guardrails for staged order requests using configured quantity, notional, and price-band limits.
-9. Paper/simulation execution scaffolding with immediate fills for market orders, resting-limit order bookkeeping, and explicit live-execution rejection.
+9. Execution bridging that uses paper fills in paper/simulation modes and builds signed live REST order requests in live mode.
 10. Trader app bootstrap that validates config and starts in non-live mode by default.
 
 ## What still explicitly does NOT include
@@ -18,6 +18,7 @@
 - Live order submission implementation
 - Withdrawal functionality
 - Full-depth market data/orderbook reconciliation
+- Real authenticated private channel subscription handling beyond login validation
 - Portfolio-level risk firewall and reconciliation logic
 - Latency guarantees
 
@@ -25,6 +26,6 @@
 
 - Domain types in `qae-core` are reusable by risk, execution, and reconciliation crates.
 - `qae-config` keeps credentials env-only to avoid accidental secret persistence.
-- `qae-okx-client` separates signing and request assembly from operation-specific APIs.
-- `qae-websocket-engine` centralizes connection lifecycle, subscription planning, runtime stream ingestion, parsing, and market snapshot state for future stream handlers.
-- `qae-risk` and `qae-execution` keep simulated order flow separate from future authenticated live execution APIs.
+- `qae-okx-client` separates signing and request assembly from operation-specific APIs, including WebSocket login and REST order submission payloads.
+- `qae-websocket-engine` centralizes connection lifecycle, startup authentication, runtime stream ingestion, parsing, and market snapshot state for future stream handlers.
+- `qae-risk` and `qae-execution` keep simulated order flow separate while still allowing live-mode tasks to build signed REST submissions safely.

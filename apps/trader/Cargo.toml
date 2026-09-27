@@ -12,7 +12,9 @@ qae-core = { path = "../../crates/core" }
 qae-execution = { path = "../../crates/execution" }
 qae-market-data = { path = "../../crates/market-data" }
 qae-monitoring = { path = "../../crates/monitoring" }
+qae-okx-client = { path = "../../crates/okx-client" }
 qae-risk = { path = "../../crates/risk" }
+qae-time = { path = "../../crates/time" }
 qae-websocket-engine = { path = "../../crates/websocket-engine" }
 tokio.workspace = true
 tracing.workspace = true

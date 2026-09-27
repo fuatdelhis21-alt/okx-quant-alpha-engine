@@ -131,6 +131,11 @@ impl AppConfig {
                 parse_bool("CONNECT_PUBLIC_STREAM_ON_STARTUP", value)?;
         }
 
+        if let Some(value) = map.get("CONNECT_PRIVATE_STREAM_ON_STARTUP") {
+            self.market_data.connect_private_stream_on_startup =
+                parse_bool("CONNECT_PRIVATE_STREAM_ON_STARTUP", value)?;
+        }
+
         if let Some(value) = map.get("STARTUP_STREAM_UPDATES_LIMIT") {
             self.market_data.startup_stream_updates_limit =
                 parse_u32("STARTUP_STREAM_UPDATES_LIMIT", value)?;
@@ -325,6 +330,12 @@ impl AppConfig {
                 self.market_data.connect_public_stream_on_startup =
                     connect_public_stream_on_startup;
             }
+            if let Some(connect_private_stream_on_startup) =
+                market_data.connect_private_stream_on_startup
+            {
+                self.market_data.connect_private_stream_on_startup =
+                    connect_private_stream_on_startup;
+            }
             if let Some(startup_stream_updates_limit) = market_data.startup_stream_updates_limit {
                 self.market_data.startup_stream_updates_limit = startup_stream_updates_limit;
             }
@@ -453,6 +464,7 @@ pub struct MarketDataConfig {
     pub subscribe_order_book: bool,
     pub order_book_depth: u32,
     pub connect_public_stream_on_startup: bool,
+    pub connect_private_stream_on_startup: bool,
     pub startup_stream_updates_limit: u32,
     pub startup_stream_timeout_ms: u64,
 }
@@ -465,6 +477,7 @@ impl Default for MarketDataConfig {
             subscribe_order_book: true,
             order_book_depth: 5,
             connect_public_stream_on_startup: false,
+            connect_private_stream_on_startup: false,
             startup_stream_updates_limit: 4,
             startup_stream_timeout_ms: 3_000,
         }
@@ -633,6 +646,7 @@ struct TomlMarketDataConfig {
     subscribe_order_book: Option<bool>,
     order_book_depth: Option<u32>,
     connect_public_stream_on_startup: Option<bool>,
+    connect_private_stream_on_startup: Option<bool>,
     startup_stream_updates_limit: Option<u32>,
     startup_stream_timeout_ms: Option<u64>,
 }
@@ -666,6 +680,7 @@ mod tests {
             vec!["BTC-USDT-SWAP".to_string()]
         );
         assert!(!cfg.market_data.connect_public_stream_on_startup);
+        assert!(!cfg.market_data.connect_private_stream_on_startup);
     }
 
     #[test]
@@ -733,6 +748,7 @@ mod tests {
             ("MARKET_DATA_INSTRUMENTS", "BTC-USDT-SWAP,ETH-USDT-SWAP"),
             ("RISK_MAX_ORDER_NOTIONAL", "25000"),
             ("CONNECT_PUBLIC_STREAM_ON_STARTUP", "true"),
+            ("CONNECT_PRIVATE_STREAM_ON_STARTUP", "true"),
         ])
         .expect("env should parse");
 
@@ -742,6 +758,7 @@ mod tests {
         );
         assert_eq!(cfg.risk.max_order_notional, 25_000.0);
         assert!(cfg.market_data.connect_public_stream_on_startup);
+        assert!(cfg.market_data.connect_private_stream_on_startup);
     }
 
     #[test]

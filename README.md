@@ -12,9 +12,10 @@ The repository currently delivers a safe-by-default foundation plus the next sca
 - Structured logging with secret redaction conventions
 - OKX REST/WebSocket client foundations
 - Market data subscription planning and OKX frame parsing scaffolding
-- Market snapshot caching for tickers and order books
+- Market snapshot caching for tickers and order books with incremental merge/checksum validation
 - Risk guardrails for staged order requests
-- Paper/simulation execution scaffolding with safe live-trading rejection
+- Paper/simulation execution scaffolding plus signed live REST order request bridging
+- Optional authenticated private WebSocket startup login flow
 
 No live order execution logic is implemented.
 
@@ -70,6 +71,7 @@ Environment variables:
   - `SUBSCRIBE_ORDER_BOOK`
   - `ORDER_BOOK_DEPTH`
   - `CONNECT_PUBLIC_STREAM_ON_STARTUP`
+  - `CONNECT_PRIVATE_STREAM_ON_STARTUP`
   - `STARTUP_STREAM_UPDATES_LIMIT`
   - `STARTUP_STREAM_TIMEOUT_MS`
 - Risk
@@ -101,3 +103,8 @@ The trader binary keeps external network access disabled by default. To exercise
 
 - `CONNECT_PUBLIC_STREAM_ON_STARTUP=true`
 - optionally tune `STARTUP_STREAM_UPDATES_LIMIT` and `STARTUP_STREAM_TIMEOUT_MS`
+
+For authenticated private WebSocket login validation on startup, also enable:
+
+- `CONNECT_PRIVATE_STREAM_ON_STARTUP=true`
+- set `OKX_API_KEY`, `OKX_API_SECRET`, and `OKX_API_PASSPHRASE`

@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use qae_config::AppConfig;
-use qae_execution::PaperExecutionEngine;
+use qae_execution::ExecutionGateway;
 use qae_monitoring::{MonitoringConfig, init_tracing};
+use qae_okx_client::{HmacSha256Signer, OkxClient};
 use qae_risk::RiskManager;
+use qae_time::SystemWallClock;
 use qae_websocket_engine::WebsocketEngine;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -21,8 +23,8 @@ async fn main() -> Result<()> {
     let mut websocket_engine =
         WebsocketEngine::new(&config).context("websocket engine configuration invalid")?;
     let risk_manager = RiskManager::new(&config).context("risk manager configuration invalid")?;
-    let execution_engine =
-        PaperExecutionEngine::new(&config).context("paper execution configuration invalid")?;
+    let _execution_gateway =
+        ExecutionGateway::new(&config).context("execution gateway configuration invalid")?;
 
     info!(
         state = ?websocket_engine.state,
@@ -31,11 +33,7 @@ async fn main() -> Result<()> {
         subscribe_requests = websocket_engine.subscription_requests().len(),
         "market data infrastructure initialized"
     );
-    info!(
-        ?risk_manager,
-        ?execution_engine,
-        "risk and paper execution scaffolding initialized"
-    );
+    info!(?risk_manager, "risk and execution scaffolding initialized");
 
     if config.market_data.connect_public_stream_on_startup {
         let updates = websocket_engine
@@ -64,6 +62,26 @@ async fn main() -> Result<()> {
         );
     } else {
         info!("public websocket startup session disabled by configuration");
+    }
+
+    if config.market_data.connect_private_stream_on_startup {
+        let okx_client = OkxClient::new(config.clone());
+        let login_command = okx_client
+            .build_ws_login_command(&HmacSha256Signer, &SystemWallClock)
+            .context("failed to build private websocket login command")?;
+
+        websocket_engine
+            .connect_private_stream(
+                config.okx.endpoints.private_ws.as_str(),
+                &login_command,
+                Duration::from_millis(config.market_data.startup_stream_timeout_ms),
+            )
+            .await
+            .context("failed to authenticate private websocket stream")?;
+
+        info!("private websocket startup authentication completed");
+    } else {
+        info!("private websocket startup session disabled by configuration");
     }
 
     Ok(())

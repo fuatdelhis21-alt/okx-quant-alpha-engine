@@ -1,7 +1,9 @@
 use qae_config::AppConfig;
 use qae_core::{ExecutionReport, OrderRequest, OrderSide, OrderStatus, OrderType, RuntimeMode};
 use qae_market_data::MarketSnapshot;
+use qae_okx_client::{OkxClient, OkxClientError, RequestSigner, SignedRequest};
 use qae_risk::{RiskManager, RiskViolation};
+use qae_time::WallClock;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -12,6 +14,49 @@ pub struct PaperExecutionEngine {
     next_order_id: u64,
     open_orders: BTreeMap<String, OrderRequest>,
     risk_manager: RiskManager,
+}
+
+#[derive(Debug)]
+pub struct ExecutionGateway {
+    mode: RuntimeMode,
+    paper_engine: PaperExecutionEngine,
+    okx_client: OkxClient,
+}
+
+impl ExecutionGateway {
+    pub fn new(config: &AppConfig) -> Result<Self, ExecutionError> {
+        Ok(Self {
+            mode: config.mode,
+            paper_engine: PaperExecutionEngine::new(config)?,
+            okx_client: OkxClient::new(config.clone()),
+        })
+    }
+
+    pub fn submit<C: WallClock>(
+        &mut self,
+        signer: &impl RequestSigner,
+        order: OrderRequest,
+        snapshot: Option<&MarketSnapshot>,
+        clock: &C,
+    ) -> Result<ExecutionSubmission, ExecutionError> {
+        match self.mode {
+            RuntimeMode::Paper | RuntimeMode::Simulation => self
+                .paper_engine
+                .submit(order, snapshot)
+                .map(ExecutionSubmission::Paper),
+            RuntimeMode::Live => self
+                .okx_client
+                .build_signed_order_request(signer, &order, clock)
+                .map(ExecutionSubmission::Live)
+                .map_err(ExecutionError::Okx),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ExecutionSubmission {
+    Paper(ExecutionReport),
+    Live(SignedRequest),
 }
 
 impl PaperExecutionEngine {
@@ -160,14 +205,26 @@ pub enum ExecutionError {
     RiskRejected(#[from] RiskViolation),
     #[error("failed to build risk manager: {0}")]
     RiskConfig(#[source] qae_risk::RiskError),
+    #[error("failed to build OKX submission: {0}")]
+    Okx(#[from] OkxClientError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, TimeZone, Utc};
     use qae_core::{InstrumentId, OrderRequest, OrderType};
     use qae_market_data::{MarketSnapshot, OrderBookLevel, OrderBookSnapshot, Ticker};
-    use qae_time::ExchangeTimestamp;
+    use qae_okx_client::HmacSha256Signer;
+    use qae_time::{ExchangeTimestamp, WallClock};
+
+    struct FixedClock(DateTime<Utc>);
+
+    impl WallClock for FixedClock {
+        fn now_utc(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
 
     fn sample_snapshot() -> MarketSnapshot {
         MarketSnapshot {
@@ -281,5 +338,76 @@ mod tests {
             engine.submit(order, Some(&sample_snapshot())),
             Err(ExecutionError::LiveExecutionUnsupported)
         ));
+    }
+
+    #[test]
+    fn execution_gateway_routes_paper_mode_to_fill_reports() {
+        let config = AppConfig::default();
+        let mut gateway = ExecutionGateway::new(&config).expect("gateway");
+        let order = OrderRequest::new(
+            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+            OrderSide::Buy,
+            OrderType::Market,
+            1.0,
+        )
+        .expect("order");
+
+        let submission = gateway
+            .submit(
+                &HmacSha256Signer,
+                order,
+                Some(&sample_snapshot()),
+                &FixedClock(
+                    Utc.timestamp_millis_opt(1_700_000_000_000)
+                        .single()
+                        .expect("ts"),
+                ),
+            )
+            .expect("submission");
+
+        assert!(matches!(submission, ExecutionSubmission::Paper(_)));
+    }
+
+    #[test]
+    fn execution_gateway_routes_live_mode_to_signed_requests() {
+        let mut config = AppConfig {
+            mode: RuntimeMode::Live,
+            live_trading: true,
+            ..AppConfig::default()
+        };
+        config.okx.credentials.api_key = Some("k".to_string());
+        config.okx.credentials.api_secret = Some("s".to_string());
+        config.okx.credentials.passphrase = Some("p".to_string());
+
+        let mut gateway = ExecutionGateway::new(&config).expect("gateway");
+        let order = OrderRequest::new(
+            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+            OrderSide::Sell,
+            OrderType::Limit,
+            1.0,
+        )
+        .and_then(|order| order.with_limit_price(101.0))
+        .expect("order");
+
+        let submission = gateway
+            .submit(
+                &HmacSha256Signer,
+                order,
+                None,
+                &FixedClock(
+                    Utc.timestamp_millis_opt(1_700_000_000_000)
+                        .single()
+                        .expect("ts"),
+                ),
+            )
+            .expect("submission");
+
+        match submission {
+            ExecutionSubmission::Live(request) => {
+                assert_eq!(request.request.path, qae_okx_client::OKX_ORDER_PATH);
+                assert!(request.request.body.contains(r#""instId":"BTC-USDT-SWAP""#));
+            }
+            ExecutionSubmission::Paper(_) => panic!("expected live request"),
+        }
     }
 }

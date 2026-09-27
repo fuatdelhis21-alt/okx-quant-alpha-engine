@@ -138,6 +138,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -605,9 +614,11 @@ dependencies = [
 name = "qae-execution"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "qae-config",
  "qae-core",
  "qae-market-data",
+ "qae-okx-client",
  "qae-risk",
  "qae-time",
  "thiserror",
@@ -641,6 +652,8 @@ dependencies = [
  "qae-config",
  "qae-core",
  "qae-time",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror",
  "url",
@@ -670,6 +683,7 @@ dependencies = [
 name = "qae-websocket-engine"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "futures-util",
  "qae-config",
  "qae-core",
@@ -773,6 +787,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -1082,7 +1097,9 @@ dependencies = [
  "qae-execution",
  "qae-market-data",
  "qae-monitoring",
+ "qae-okx-client",
  "qae-risk",
+ "qae-time",
  "qae-websocket-engine",
  "tokio",
  "tracing",
