@@ -5,8 +5,8 @@ use qae_market_data::{
     MarketDataError, MarketDataUpdate, MarketSnapshot, OrderBookLevel, OrderBookSnapshot, Ticker,
 };
 use qae_time::ExchangeTimestamp;
-use serde::Deserialize;
 use serde::de::IgnoredAny;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -176,19 +176,19 @@ impl WebsocketEngine {
         let args = self
             .subscriptions
             .iter()
-            .map(|subscription| {
-                format!(
-                    r#"{{"channel":"{}","instId":"{}"}}"#,
-                    subscription.channel.as_okx_channel(self.order_book_depth),
-                    subscription.instrument_id.as_str()
-                )
+            .map(|subscription| SubscriptionArg {
+                channel: subscription.channel.as_okx_channel(self.order_book_depth),
+                inst_id: subscription.instrument_id.as_str(),
             })
             .collect::<Vec<_>>();
 
-        vec![format!(
-            r#"{{"op":"subscribe","args":[{}]}}"#,
-            args.join(",")
-        )]
+        vec![
+            serde_json::to_string(&SubscriptionRequest {
+                op: "subscribe",
+                args,
+            })
+            .expect("subscription serialization must succeed"),
+        ]
     }
 
     pub async fn connect_public_stream(
@@ -239,8 +239,8 @@ impl WebsocketEngine {
         let inst_id = arg
             .inst_id
             .ok_or(WebsocketEngineError::MissingInstrumentId)?;
-        let instrument_id =
-            InstrumentId::new(inst_id).map_err(|_| WebsocketEngineError::MissingInstrumentId)?;
+        let instrument_id = InstrumentId::new(inst_id.clone())
+            .map_err(|_| WebsocketEngineError::InvalidInstrument(inst_id))?;
         let channel = arg.channel;
         let mut updates = Vec::new();
 
@@ -357,6 +357,7 @@ impl WebsocketEngine {
                         .send(Message::Ping(Vec::new().into()))
                         .await
                         .map_err(|source| self.register_transport_error(source))?;
+                    heartbeat.mark_heartbeat();
                 }
             }
         }
@@ -489,6 +490,19 @@ struct FrameArg {
     channel: String,
     #[serde(rename = "instId")]
     inst_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubscriptionRequest<'a> {
+    op: &'static str,
+    args: Vec<SubscriptionArg<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubscriptionArg<'a> {
+    channel: &'static str,
+    #[serde(rename = "instId")]
+    inst_id: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
