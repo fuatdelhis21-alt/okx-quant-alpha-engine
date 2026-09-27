@@ -8,6 +8,10 @@ rust-version.workspace = true
 [dependencies]
 qae-core = { path = "../core" }
 qae-config = { path = "../config" }
+qae-market-data = { path = "../market-data" }
+qae-time = { path = "../time" }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

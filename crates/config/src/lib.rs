@@ -19,6 +19,9 @@ pub struct AppConfig {
     pub mode: RuntimeMode,
     pub okx: OkxConfig,
     pub network: NetworkConfig,
+    pub market_data: MarketDataConfig,
+    pub risk: RiskConfig,
+    pub execution: ExecutionConfig,
 }
 
 impl Default for AppConfig {
@@ -28,6 +31,9 @@ impl Default for AppConfig {
             mode: RuntimeMode::Paper,
             okx: OkxConfig::default(),
             network: NetworkConfig::default(),
+            market_data: MarketDataConfig::default(),
+            risk: RiskConfig::default(),
+            execution: ExecutionConfig::default(),
         }
     }
 }
@@ -104,8 +110,48 @@ impl AppConfig {
             self.network.rate_limit_per_second = parse_u32("RATE_LIMIT_PER_SECOND", value)?;
         }
 
+        if let Some(value) = map.get("MARKET_DATA_INSTRUMENTS") {
+            self.market_data.instruments = parse_csv_list(value)?;
+        }
+
+        if let Some(value) = map.get("SUBSCRIBE_TICKERS") {
+            self.market_data.subscribe_tickers = parse_bool("SUBSCRIBE_TICKERS", value)?;
+        }
+
+        if let Some(value) = map.get("SUBSCRIBE_ORDER_BOOK") {
+            self.market_data.subscribe_order_book = parse_bool("SUBSCRIBE_ORDER_BOOK", value)?;
+        }
+
+        if let Some(value) = map.get("ORDER_BOOK_DEPTH") {
+            self.market_data.order_book_depth = parse_u32("ORDER_BOOK_DEPTH", value)?;
+        }
+
+        if let Some(value) = map.get("RISK_MAX_ORDER_QUANTITY") {
+            self.risk.max_order_quantity = parse_f64("RISK_MAX_ORDER_QUANTITY", value)?;
+        }
+
+        if let Some(value) = map.get("RISK_MAX_ORDER_NOTIONAL") {
+            self.risk.max_order_notional = parse_f64("RISK_MAX_ORDER_NOTIONAL", value)?;
+        }
+
+        if let Some(value) = map.get("RISK_MAX_PRICE_DEVIATION_BPS") {
+            self.risk.max_price_deviation_bps = parse_f64("RISK_MAX_PRICE_DEVIATION_BPS", value)?;
+        }
+
+        if let Some(value) = map.get("PAPER_STARTING_BALANCE_USDT") {
+            self.execution.paper_starting_balance_usdt =
+                parse_f64("PAPER_STARTING_BALANCE_USDT", value)?;
+        }
+
+        if let Some(value) = map.get("PAPER_FILL_SLIPPAGE_BPS") {
+            self.execution.paper_fill_slippage_bps = parse_f64("PAPER_FILL_SLIPPAGE_BPS", value)?;
+        }
+
         self.okx.credentials = ApiCredentials {
-            api_key: map.get("OKX_API_KEY").cloned().filter(|v| !v.trim().is_empty()),
+            api_key: map
+                .get("OKX_API_KEY")
+                .cloned()
+                .filter(|v| !v.trim().is_empty()),
             api_secret: map
                 .get("OKX_API_SECRET")
                 .cloned()
@@ -129,6 +175,45 @@ impl AppConfig {
 
         if self.mode.is_live() && !self.okx.credentials.is_complete() {
             return Err(ConfigError::MissingLiveCredentials);
+        }
+
+        if self.market_data.instruments.is_empty() {
+            return Err(ConfigError::EmptyMarketDataInstruments);
+        }
+
+        if !self.market_data.subscribe_tickers && !self.market_data.subscribe_order_book {
+            return Err(ConfigError::NoMarketDataSubscriptions);
+        }
+
+        if self.market_data.order_book_depth == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "ORDER_BOOK_DEPTH",
+                value: self.market_data.order_book_depth.to_string(),
+            });
+        }
+
+        for (name, value) in [
+            ("RISK_MAX_ORDER_QUANTITY", self.risk.max_order_quantity),
+            ("RISK_MAX_ORDER_NOTIONAL", self.risk.max_order_notional),
+            (
+                "RISK_MAX_PRICE_DEVIATION_BPS",
+                self.risk.max_price_deviation_bps,
+            ),
+            (
+                "PAPER_STARTING_BALANCE_USDT",
+                self.execution.paper_starting_balance_usdt,
+            ),
+            (
+                "PAPER_FILL_SLIPPAGE_BPS",
+                self.execution.paper_fill_slippage_bps,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    name,
+                    value: value.to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -160,13 +245,16 @@ impl AppConfig {
                     self.okx.endpoints.rest = parse_url("okx.endpoints.rest", &rest)?;
                 }
                 if let Some(public_ws) = endpoints.public_ws {
-                    self.okx.endpoints.public_ws = parse_url("okx.endpoints.public_ws", &public_ws)?;
+                    self.okx.endpoints.public_ws =
+                        parse_url("okx.endpoints.public_ws", &public_ws)?;
                 }
                 if let Some(private_ws) = endpoints.private_ws {
-                    self.okx.endpoints.private_ws = parse_url("okx.endpoints.private_ws", &private_ws)?;
+                    self.okx.endpoints.private_ws =
+                        parse_url("okx.endpoints.private_ws", &private_ws)?;
                 }
                 if let Some(business_ws) = endpoints.business_ws {
-                    self.okx.endpoints.business_ws = parse_url("okx.endpoints.business_ws", &business_ws)?;
+                    self.okx.endpoints.business_ws =
+                        parse_url("okx.endpoints.business_ws", &business_ws)?;
                 }
             }
         }
@@ -180,6 +268,42 @@ impl AppConfig {
             }
             if let Some(rate_limit_per_second) = network.rate_limit_per_second {
                 self.network.rate_limit_per_second = rate_limit_per_second;
+            }
+        }
+
+        if let Some(market_data) = file_cfg.market_data {
+            if let Some(instruments) = market_data.instruments {
+                self.market_data.instruments = instruments;
+            }
+            if let Some(subscribe_tickers) = market_data.subscribe_tickers {
+                self.market_data.subscribe_tickers = subscribe_tickers;
+            }
+            if let Some(subscribe_order_book) = market_data.subscribe_order_book {
+                self.market_data.subscribe_order_book = subscribe_order_book;
+            }
+            if let Some(order_book_depth) = market_data.order_book_depth {
+                self.market_data.order_book_depth = order_book_depth;
+            }
+        }
+
+        if let Some(risk) = file_cfg.risk {
+            if let Some(max_order_quantity) = risk.max_order_quantity {
+                self.risk.max_order_quantity = max_order_quantity;
+            }
+            if let Some(max_order_notional) = risk.max_order_notional {
+                self.risk.max_order_notional = max_order_notional;
+            }
+            if let Some(max_price_deviation_bps) = risk.max_price_deviation_bps {
+                self.risk.max_price_deviation_bps = max_price_deviation_bps;
+            }
+        }
+
+        if let Some(execution) = file_cfg.execution {
+            if let Some(paper_starting_balance_usdt) = execution.paper_starting_balance_usdt {
+                self.execution.paper_starting_balance_usdt = paper_starting_balance_usdt;
+            }
+            if let Some(paper_fill_slippage_bps) = execution.paper_fill_slippage_bps {
+                self.execution.paper_fill_slippage_bps = paper_fill_slippage_bps;
             }
         }
 
@@ -275,6 +399,57 @@ impl Default for NetworkConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MarketDataConfig {
+    pub instruments: Vec<String>,
+    pub subscribe_tickers: bool,
+    pub subscribe_order_book: bool,
+    pub order_book_depth: u32,
+}
+
+impl Default for MarketDataConfig {
+    fn default() -> Self {
+        Self {
+            instruments: vec!["BTC-USDT-SWAP".to_string()],
+            subscribe_tickers: true,
+            subscribe_order_book: true,
+            order_book_depth: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RiskConfig {
+    pub max_order_quantity: f64,
+    pub max_order_notional: f64,
+    pub max_price_deviation_bps: f64,
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            max_order_quantity: 5.0,
+            max_order_notional: 100_000.0,
+            max_price_deviation_bps: 500.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionConfig {
+    pub paper_starting_balance_usdt: f64,
+    pub paper_fill_slippage_bps: f64,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            paper_starting_balance_usdt: 100_000.0,
+            paper_fill_slippage_bps: 2.0,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file {path}: {source}")]
@@ -291,9 +466,16 @@ pub enum ConfigError {
     #[error("invalid endpoint URL for {name}: {value}")]
     InvalidUrl { name: &'static str, value: String },
     #[error("runtime mode ({mode}) must match LIVE_TRADING={live_trading}")]
-    LiveModeMismatch { mode: RuntimeMode, live_trading: bool },
+    LiveModeMismatch {
+        mode: RuntimeMode,
+        live_trading: bool,
+    },
     #[error("live mode requires OKX_API_KEY, OKX_API_SECRET, and OKX_API_PASSPHRASE")]
     MissingLiveCredentials,
+    #[error("market data requires at least one configured instrument")]
+    EmptyMarketDataInstruments,
+    #[error("at least one market data subscription must be enabled")]
+    NoMarketDataSubscriptions,
 }
 
 fn parse_bool(name: &'static str, value: &str) -> Result<bool, ConfigError> {
@@ -327,11 +509,36 @@ fn parse_u32(name: &'static str, value: &str) -> Result<u32, ConfigError> {
         })
 }
 
+fn parse_f64(name: &'static str, value: &str) -> Result<f64, ConfigError> {
+    value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| ConfigError::InvalidValue {
+            name,
+            value: value.to_owned(),
+        })
+}
+
 fn parse_url(name: &'static str, value: &str) -> Result<Url, ConfigError> {
     Url::parse(value).map_err(|_| ConfigError::InvalidUrl {
         name,
         value: value.to_owned(),
     })
+}
+
+fn parse_csv_list(value: &str) -> Result<Vec<String>, ConfigError> {
+    let parsed = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if parsed.is_empty() {
+        return Err(ConfigError::EmptyMarketDataInstruments);
+    }
+
+    Ok(parsed)
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,6 +547,9 @@ struct TomlAppConfig {
     mode: Option<RuntimeMode>,
     okx: Option<TomlOkxConfig>,
     network: Option<TomlNetworkConfig>,
+    market_data: Option<TomlMarketDataConfig>,
+    risk: Option<TomlRiskConfig>,
+    execution: Option<TomlExecutionConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,6 +573,27 @@ struct TomlNetworkConfig {
     rate_limit_per_second: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TomlMarketDataConfig {
+    instruments: Option<Vec<String>>,
+    subscribe_tickers: Option<bool>,
+    subscribe_order_book: Option<bool>,
+    order_book_depth: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlRiskConfig {
+    max_order_quantity: Option<f64>,
+    max_order_notional: Option<f64>,
+    max_price_deviation_bps: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlExecutionConfig {
+    paper_starting_balance_usdt: Option<f64>,
+    paper_fill_slippage_bps: Option<f64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +605,10 @@ mod tests {
         assert_eq!(cfg.mode, RuntimeMode::Paper);
         assert_eq!(cfg.okx.endpoints.rest.as_str(), "https://www.okx.com/");
         assert!(!cfg.okx.credentials.is_complete());
+        assert_eq!(
+            cfg.market_data.instruments,
+            vec!["BTC-USDT-SWAP".to_string()]
+        );
     }
 
     #[test]
@@ -382,16 +617,21 @@ mod tests {
         cfg.apply_env_overrides(vec![("OKX_PUBLIC_WS_ENDPOINT", "wss://example.com/public")])
             .expect("env should parse");
         assert_eq!(
-            cfg.okx.endpoints.ws_endpoint(WsEndpointKind::Public).as_str(),
+            cfg.okx
+                .endpoints
+                .ws_endpoint(WsEndpointKind::Public)
+                .as_str(),
             "wss://example.com/public"
         );
     }
 
     #[test]
     fn validation_requires_consistent_live_mode() {
-        let mut cfg = AppConfig::default();
-        cfg.live_trading = true;
-        cfg.mode = RuntimeMode::Paper;
+        let cfg = AppConfig {
+            live_trading: true,
+            mode: RuntimeMode::Paper,
+            ..AppConfig::default()
+        };
 
         assert!(matches!(
             cfg.validate(),
@@ -401,9 +641,11 @@ mod tests {
 
     #[test]
     fn live_mode_requires_credentials() {
-        let mut cfg = AppConfig::default();
-        cfg.live_trading = true;
-        cfg.mode = RuntimeMode::Live;
+        let cfg = AppConfig {
+            live_trading: true,
+            mode: RuntimeMode::Live,
+            ..AppConfig::default()
+        };
 
         assert!(matches!(
             cfg.validate(),
@@ -413,9 +655,11 @@ mod tests {
 
     #[test]
     fn live_mode_passes_with_credentials() {
-        let mut cfg = AppConfig::default();
-        cfg.live_trading = true;
-        cfg.mode = RuntimeMode::Live;
+        let mut cfg = AppConfig {
+            live_trading: true,
+            mode: RuntimeMode::Live,
+            ..AppConfig::default()
+        };
         cfg.okx.credentials = ApiCredentials {
             api_key: Some("k".to_string()),
             api_secret: Some("s".to_string()),
@@ -423,5 +667,33 @@ mod tests {
         };
 
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn env_overrides_market_data_and_risk() {
+        let mut cfg = AppConfig::default();
+        cfg.apply_env_overrides(vec![
+            ("MARKET_DATA_INSTRUMENTS", "BTC-USDT-SWAP,ETH-USDT-SWAP"),
+            ("RISK_MAX_ORDER_NOTIONAL", "25000"),
+        ])
+        .expect("env should parse");
+
+        assert_eq!(
+            cfg.market_data.instruments,
+            vec!["BTC-USDT-SWAP".to_string(), "ETH-USDT-SWAP".to_string()]
+        );
+        assert_eq!(cfg.risk.max_order_notional, 25_000.0);
+    }
+
+    #[test]
+    fn validation_requires_market_data_subscription() {
+        let mut cfg = AppConfig::default();
+        cfg.market_data.subscribe_tickers = false;
+        cfg.market_data.subscribe_order_book = false;
+
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::NoMarketDataSubscriptions)
+        ));
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "qae-risk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+qae-config = { path = "../config" }
+qae-core = { path = "../core" }
+qae-market-data = { path = "../market-data" }
+thiserror.workspace = true
+
+[dev-dependencies]
+qae-time = { path = "../time" }

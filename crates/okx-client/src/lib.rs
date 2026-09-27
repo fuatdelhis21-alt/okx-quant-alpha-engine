@@ -54,8 +54,11 @@ impl OkxClient {
             _ => return Err(OkxClientError::MissingCredentials),
         };
 
-        let timestamp = clock.now_utc().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let signature_payload = signature_payload(&timestamp, &request.method, &request.path, &request.body);
+        let timestamp = clock
+            .now_utc()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let signature_payload =
+            signature_payload(&timestamp, &request.method, &request.path, &request.body);
         let signature = signer.sign(api_secret, &signature_payload)?;
 
         let mut headers = BTreeMap::new();
@@ -203,11 +206,21 @@ mod tests {
             .build_authenticated_request(
                 &HmacSha256Signer,
                 request,
-                &FixedClock(Utc.timestamp_millis_opt(1_700_000_000_000).single().expect("valid ts")),
+                &FixedClock(
+                    Utc.timestamp_millis_opt(1_700_000_000_000)
+                        .single()
+                        .expect("valid ts"),
+                ),
             )
             .expect("signing should succeed");
 
-        assert_eq!(signed.headers.get(OKX_SIMULATED_TRADING).map(String::as_str), Some("1"));
+        assert_eq!(
+            signed
+                .headers
+                .get(OKX_SIMULATED_TRADING)
+                .map(String::as_str),
+            Some("1")
+        );
     }
 
     #[test]

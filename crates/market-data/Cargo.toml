@@ -1,0 +1,11 @@
+[package]
+name = "qae-market-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+qae-core = { path = "../core" }
+qae-time = { path = "../time" }
+thiserror.workspace = true

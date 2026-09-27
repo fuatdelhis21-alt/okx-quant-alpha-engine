@@ -468,6 +468,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "qae-execution"
+version = "0.1.0"
+dependencies = [
+ "qae-config",
+ "qae-core",
+ "qae-market-data",
+ "qae-risk",
+ "qae-time",
+ "thiserror",
+]
+
+[[package]]
+name = "qae-market-data"
+version = "0.1.0"
+dependencies = [
+ "qae-core",
+ "qae-time",
+ "thiserror",
+]
+
+[[package]]
 name = "qae-monitoring"
 version = "0.1.0"
 dependencies = [
@@ -492,6 +513,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "qae-risk"
+version = "0.1.0"
+dependencies = [
+ "qae-config",
+ "qae-core",
+ "qae-market-data",
+ "qae-time",
+ "thiserror",
+]
+
+[[package]]
 name = "qae-time"
 version = "0.1.0"
 dependencies = [
@@ -506,6 +538,10 @@ version = "0.1.0"
 dependencies = [
  "qae-config",
  "qae-core",
+ "qae-market-data",
+ "qae-time",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
@@ -845,7 +881,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "qae-config",
+ "qae-core",
+ "qae-execution",
  "qae-monitoring",
+ "qae-risk",
  "qae-websocket-engine",
  "tracing",
 ]

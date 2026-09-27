@@ -2,9 +2,12 @@
 members = [
   "crates/core",
   "crates/config",
+  "crates/market-data",
   "crates/time",
   "crates/monitoring",
   "crates/okx-client",
+  "crates/risk",
+  "crates/execution",
   "crates/websocket-engine",
   "apps/trader",
 ]
