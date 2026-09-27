@@ -1,5 +1,8 @@
 use qae_config::AppConfig;
-use qae_core::{ExecutionReport, FillUpdate, InstrumentId, OrderRequest, OrderSide, OrderStatus, OrderType, PositionUpdate};
+use qae_core::{
+    ExecutionReport, FillUpdate, InstrumentId, OrderRequest, OrderSide, OrderStatus, OrderType,
+    PositionUpdate,
+};
 use qae_market_data::MarketSnapshot;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -123,7 +126,11 @@ impl PortfolioRiskManager {
         state: &PortfolioRiskState,
     ) -> Result<RiskApproval, RiskViolation> {
         let approval = self.order_risk.evaluate(order, snapshot)?;
-        let projected_position = state.position_notional(&order.instrument_id) + approval.notional;
+        let current_position = state.position_notional(&order.instrument_id);
+        let projected_position = match order.side {
+            OrderSide::Buy => current_position + approval.notional,
+            OrderSide::Sell => (current_position - approval.notional).max(0.0),
+        };
         if projected_position > self.max_position_notional {
             return Err(RiskViolation::PositionNotionalTooLarge {
                 instrument_id: order.instrument_id.to_string(),
@@ -132,7 +139,8 @@ impl PortfolioRiskManager {
             });
         }
 
-        let projected_total = state.total_exposure_notional + approval.notional;
+        let projected_total =
+            (state.total_exposure_notional - current_position).max(0.0) + projected_position;
         if projected_total > self.max_total_exposure_notional {
             return Err(RiskViolation::TotalExposureTooLarge {
                 projected: projected_total,

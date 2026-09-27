@@ -459,7 +459,6 @@ impl WebsocketEngine {
                         .send(Message::Ping(Vec::new().into()))
                         .await
                         .map_err(|source| self.register_transport_error(source))?;
-                    heartbeat.mark_heartbeat();
                 }
             }
         }
@@ -528,7 +527,6 @@ impl WebsocketEngine {
                         .send(Message::Ping(Vec::new().into()))
                         .await
                         .map_err(|source| self.register_transport_error(source))?;
-                    heartbeat.mark_heartbeat();
                 }
             }
         }
@@ -745,7 +743,11 @@ fn parse_order_event(value: serde_json::Value) -> Result<ExecutionReport, Websoc
         "filled" => OrderStatus::Filled,
         "canceled" | "mmp_canceled" => OrderStatus::Cancelled,
         "rejected" => OrderStatus::Rejected,
-        other => return Err(WebsocketEngineError::UnsupportedOrderState(other.to_string())),
+        other => {
+            return Err(WebsocketEngineError::UnsupportedOrderState(
+                other.to_string(),
+            ));
+        }
     };
 
     Ok(ExecutionReport {

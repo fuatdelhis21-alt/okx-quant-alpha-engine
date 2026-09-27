@@ -1,8 +1,10 @@
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, Mac};
 use qae_config::{AppConfig, WsEndpointKind};
-use qae_core::{ExecutionReport, OrderRequest, OrderSide, OrderStatus, OrderType, RequestPriority, RuntimeMode};
+use qae_core::{
+    ExecutionReport, OrderRequest, OrderSide, OrderStatus, OrderType, RequestPriority, RuntimeMode,
+};
 use qae_time::{ExchangeTimestamp, WallClock};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -100,8 +102,8 @@ impl OkxClient {
             .validate()
             .map_err(|error| OkxClientError::InvalidOrder(error.to_string()))?;
 
-        let body =
-            serde_json::to_string(&OkxOrderBody::from(order)).map_err(OkxClientError::SerializePayload)?;
+        let body = serde_json::to_string(&OkxOrderBody::from(order))
+            .map_err(OkxClientError::SerializePayload)?;
 
         Ok(RestRequest::new("POST", OKX_ORDER_PATH)
             .with_priority(RequestPriority::High)
@@ -234,18 +236,16 @@ impl LiveOrderTransport for ReqwestLiveOrderTransport {
         let url = endpoint
             .join(request.request.path.trim_start_matches('/'))
             .map_err(OkxClientError::JoinUrl)?;
-        let mut builder = self
-            .client
-            .request(
-                request
-                    .request
-                    .method
-                    .parse()
-                    .map_err(|_| OkxClientError::InvalidMethod(request.request.method.clone()))?,
-                url,
-            )
-            .timeout(std::time::Duration::from_millis(timeout_ms))
-            .body(request.request.body.clone());
+        let mut builder =
+            self.client
+                .request(
+                    request.request.method.parse().map_err(|_| {
+                        OkxClientError::InvalidMethod(request.request.method.clone())
+                    })?,
+                    url,
+                )
+                .timeout(std::time::Duration::from_millis(timeout_ms))
+                .body(request.request.body.clone());
 
         for (key, value) in &request.headers {
             builder = builder.header(key, value);
@@ -380,7 +380,9 @@ fn parse_order_submission_response(
     if ack.status_code.as_deref().unwrap_or("0") != "0" {
         return Err(OkxClientError::ApiRejected {
             code: ack.status_code.unwrap_or_else(|| "unknown".to_string()),
-            message: ack.status_message.unwrap_or_else(|| "order rejected".to_string()),
+            message: ack
+                .status_message
+                .unwrap_or_else(|| "order rejected".to_string()),
         });
     }
 
@@ -497,7 +499,10 @@ mod tests {
             .expect("signing should succeed");
 
         assert_eq!(
-            signed.headers.get(OKX_SIMULATED_TRADING).map(String::as_str),
+            signed
+                .headers
+                .get(OKX_SIMULATED_TRADING)
+                .map(String::as_str),
             Some("1")
         );
     }
@@ -522,9 +527,9 @@ mod tests {
             )
             .expect("login command");
 
-        assert!(command.contains(r#"\"op\":\"login\""#));
-        assert!(command.contains(r#"\"apiKey\":\"k\""#));
-        assert!(command.contains(r#"\"timestamp\":\"1700000000\""#));
+        assert!(command.contains(r#""op":"login""#));
+        assert!(command.contains(r#""apiKey":"k""#));
+        assert!(command.contains(r#""timestamp":"1700000000""#));
     }
 
     #[test]
@@ -559,8 +564,8 @@ mod tests {
             .expect("signed request");
 
         assert_eq!(signed.request.path, OKX_ORDER_PATH);
-        assert!(signed.request.body.contains(r#"\"instId\":\"BTC-USDT-SWAP\""#));
-        assert!(signed.request.body.contains(r#"\"clOrdId\":\"cid-1\""#));
+        assert!(signed.request.body.contains(r#""instId":"BTC-USDT-SWAP""#));
+        assert!(signed.request.body.contains(r#""clOrdId":"cid-1""#));
         assert_eq!(
             signed.headers.get(OKX_ACCESS_KEY).map(String::as_str),
             Some("k")

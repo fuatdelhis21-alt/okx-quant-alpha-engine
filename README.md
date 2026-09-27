@@ -14,10 +14,10 @@ The repository currently delivers a safe-by-default foundation plus the next sca
 - Market data subscription planning and OKX frame parsing scaffolding
 - Market snapshot caching for tickers and order books with incremental merge/checksum validation
 - Risk guardrails for staged order requests
-- Paper/simulation execution scaffolding plus signed live REST order request bridging
-- Optional authenticated private WebSocket startup login flow
+- Paper/simulation execution scaffolding plus normalized live REST order submission
+- Optional authenticated private WebSocket startup login, subscription, and private event parsing flow
 
-No live order execution logic is implemented.
+The repository still does not include a full OMS/strategy layer, but live order acknowledgements and private stream events now flow through shared execution-report types.
 
 ## Workspace structure
 
@@ -26,10 +26,10 @@ No live order execution logic is implemented.
 - `crates/market-data`: ticker/order-book domain types and snapshot helpers
 - `crates/time`: wall clock, exchange timestamp, monotonic elapsed timing, offset state scaffolding
 - `crates/monitoring`: tracing initialization and secret-safe helpers
-- `crates/okx-client`: OKX V5 request/signing foundation and safe operation stubs
-- `crates/risk`: order guardrails based on market snapshots and configured limits
-- `crates/execution`: paper/simulation order submission flow and resting-order bookkeeping
-- `crates/websocket-engine`: bounded-channel engine scaffolding, reconnect/backoff, heartbeat, subscriptions, parsing, and snapshot cache
+- `crates/okx-client`: OKX V5 request/signing foundation, websocket login, and live order submission transport
+- `crates/risk`: order guardrails plus portfolio-risk state scaffolding
+- `crates/execution`: paper/simulation order submission flow, live execution gateway, and reconciliation state
+- `crates/websocket-engine`: bounded-channel engine scaffolding, reconnect/backoff, heartbeat, subscriptions, parsing, private event ingestion, and snapshot cache
 - `apps/trader`: startup binary wiring config + monitoring + websocket/risk/execution scaffolding
 
 ## Safety model
@@ -38,7 +38,7 @@ No live order execution logic is implemented.
 - runtime `mode` defaults to `paper`
 - `mode` and `LIVE_TRADING` must agree (`live` only when both are enabled)
 - API credentials are loaded **only** from environment variables
-- live order submission is explicitly stubbed as unsupported
+- live trading still stays opt-in and credential-gated
 - withdrawals are explicitly unsupported
 - demo trading header support is configurable (`OKX_DEMO_TRADING`, default `true`)
 
@@ -78,6 +78,10 @@ Environment variables:
   - `RISK_MAX_ORDER_QUANTITY`
   - `RISK_MAX_ORDER_NOTIONAL`
   - `RISK_MAX_PRICE_DEVIATION_BPS`
+  - `RISK_MAX_POSITION_NOTIONAL`
+  - `RISK_MAX_TOTAL_EXPOSURE_NOTIONAL`
+  - `RISK_MAX_DAILY_LOSS`
+  - `RISK_MAX_OPEN_ORDERS`
 - Paper execution
   - `PAPER_STARTING_BALANCE_USDT`
   - `PAPER_FILL_SLIPPAGE_BPS`
@@ -104,7 +108,7 @@ The trader binary keeps external network access disabled by default. To exercise
 - `CONNECT_PUBLIC_STREAM_ON_STARTUP=true`
 - optionally tune `STARTUP_STREAM_UPDATES_LIMIT` and `STARTUP_STREAM_TIMEOUT_MS`
 
-For authenticated private WebSocket login validation on startup, also enable:
+For authenticated private WebSocket login plus account/orders/positions/fills startup handling, also enable:
 
 - `CONNECT_PRIVATE_STREAM_ON_STARTUP=true`
 - set `OKX_API_KEY`, `OKX_API_SECRET`, and `OKX_API_PASSPHRASE`

@@ -23,7 +23,7 @@ pub struct ExecutionGateway {
     mode: RuntimeMode,
     paper_engine: PaperExecutionEngine,
     okx_client: OkxClient,
-    transport: ReqwestLiveOrderTransport,
+    transport: Option<ReqwestLiveOrderTransport>,
     portfolio_risk: PortfolioRiskManager,
     reconciliation: ReconciliationState,
     next_live_client_order_id: u64,
@@ -35,8 +35,9 @@ impl ExecutionGateway {
             mode: config.mode,
             paper_engine: PaperExecutionEngine::new(config)?,
             okx_client: OkxClient::new(config.clone()),
-            transport: ReqwestLiveOrderTransport::new().map_err(ExecutionError::Okx)?,
-            portfolio_risk: PortfolioRiskManager::new(config).map_err(ExecutionError::PortfolioRiskConfig)?,
+            transport: None,
+            portfolio_risk: PortfolioRiskManager::new(config)
+                .map_err(ExecutionError::PortfolioRiskConfig)?,
             reconciliation: ReconciliationState::default(),
             next_live_client_order_id: 1,
         })
@@ -55,11 +56,19 @@ impl ExecutionGateway {
             .map_err(ExecutionError::PortfolioRiskRejected)?;
 
         let report = match self.mode {
-            RuntimeMode::Paper | RuntimeMode::Simulation => self.paper_engine.submit(order.clone(), snapshot)?,
-            RuntimeMode::Live => self
-                .okx_client
-                .submit_live_order(&self.transport, signer, &order, clock)
-                .map_err(ExecutionError::Okx)?,
+            RuntimeMode::Paper | RuntimeMode::Simulation => {
+                self.paper_engine.submit(order.clone(), snapshot)?
+            }
+            RuntimeMode::Live => {
+                if self.transport.is_none() {
+                    self.transport =
+                        Some(ReqwestLiveOrderTransport::new().map_err(ExecutionError::Okx)?);
+                }
+                let transport = self.transport.as_ref().expect("transport initialized");
+                self.okx_client
+                    .submit_live_order(transport, signer, &order, clock)
+                    .map_err(ExecutionError::Okx)?
+            }
         };
 
         self.reconciliation.record_submission(order, report.clone());
@@ -124,11 +133,22 @@ impl ReconciliationState {
             PrivateStreamEvent::Fill(fill) => {
                 self.portfolio_risk.apply_fill_update(&fill);
                 self.fills.push(fill.clone());
-                self.reports
-                    .get_mut(&fill.order_id)
+                let report_key = if self.reports.contains_key(&fill.order_id) {
+                    Some(fill.order_id.clone())
+                } else {
+                    fill.client_order_id.as_ref().and_then(|client_order_id| {
+                        self.reports_by_client_order_id
+                            .get(client_order_id)
+                            .cloned()
+                    })
+                };
+
+                report_key
+                    .and_then(|report_key| self.reports.get_mut(&report_key))
                     .map(|report| {
                         report.filled_quantity += fill.fill_quantity;
-                        report.remaining_quantity = (report.remaining_quantity - fill.fill_quantity).max(0.0);
+                        report.remaining_quantity =
+                            (report.remaining_quantity - fill.fill_quantity).max(0.0);
                         report.average_fill_price = Some(fill.fill_price);
                         report.status = if report.remaining_quantity > 0.0 {
                             OrderStatus::PartiallyFilled
@@ -168,7 +188,10 @@ impl ReconciliationState {
 }
 
 fn status_is_open(status: OrderStatus) -> bool {
-    matches!(status, OrderStatus::Submitted | OrderStatus::Accepted | OrderStatus::PartiallyFilled)
+    matches!(
+        status,
+        OrderStatus::Submitted | OrderStatus::Accepted | OrderStatus::PartiallyFilled
+    )
 }
 
 impl PaperExecutionEngine {
@@ -354,7 +377,9 @@ mod tests {
         )
         .expect("order");
 
-        let report = engine.submit(order, Some(&sample_snapshot())).expect("report");
+        let report = engine
+            .submit(order, Some(&sample_snapshot()))
+            .expect("report");
 
         assert_eq!(report.status, OrderStatus::Filled);
         assert_eq!(report.average_fill_price, Some(100.5201));
@@ -373,7 +398,9 @@ mod tests {
         .and_then(|order| order.with_limit_price(99.0))
         .expect("order");
 
-        let report = engine.submit(order, Some(&sample_snapshot())).expect("report");
+        let report = engine
+            .submit(order, Some(&sample_snapshot()))
+            .expect("report");
 
         assert_eq!(report.status, OrderStatus::Accepted);
     }
@@ -391,7 +418,9 @@ mod tests {
         .and_then(|order| order.with_limit_price(99.0))
         .expect("order");
 
-        let report = engine.submit(order, Some(&sample_snapshot())).expect("report");
+        let report = engine
+            .submit(order, Some(&sample_snapshot()))
+            .expect("report");
 
         assert_eq!(report.status, OrderStatus::Filled);
         assert_eq!(report.average_fill_price, Some(99.5));
@@ -496,7 +525,7 @@ mod tests {
             }))
             .is_some();
 
-        assert!(!updated);
+        assert!(updated);
         assert_eq!(reconciliation.fills.len(), 1);
         assert_eq!(reconciliation.reports["ord-1"].status, OrderStatus::Filled);
     }
