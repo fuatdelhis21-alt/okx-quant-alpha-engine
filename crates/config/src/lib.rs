@@ -203,10 +203,6 @@ impl AppConfig {
                 "PAPER_STARTING_BALANCE_USDT",
                 self.execution.paper_starting_balance_usdt,
             ),
-            (
-                "PAPER_FILL_SLIPPAGE_BPS",
-                self.execution.paper_fill_slippage_bps,
-            ),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(ConfigError::InvalidValue {
@@ -214,6 +210,16 @@ impl AppConfig {
                     value: value.to_string(),
                 });
             }
+        }
+
+        if !self.execution.paper_fill_slippage_bps.is_finite()
+            || self.execution.paper_fill_slippage_bps <= 0.0
+            || self.execution.paper_fill_slippage_bps >= 10_000.0
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "PAPER_FILL_SLIPPAGE_BPS",
+                value: self.execution.paper_fill_slippage_bps.to_string(),
+            });
         }
 
         Ok(())
@@ -694,6 +700,34 @@ mod tests {
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::NoMarketDataSubscriptions)
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_zero_order_book_depth() {
+        let mut cfg = AppConfig::default();
+        cfg.market_data.order_book_depth = 0;
+
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                name: "ORDER_BOOK_DEPTH",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_slippage_bounds() {
+        let mut cfg = AppConfig::default();
+        cfg.execution.paper_fill_slippage_bps = 10_000.0;
+
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                name: "PAPER_FILL_SLIPPAGE_BPS",
+                ..
+            })
         ));
     }
 }

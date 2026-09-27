@@ -92,7 +92,12 @@ impl PaperExecutionEngine {
         };
 
         if is_crossing {
-            Ok(self.filled_report(order, order_id, reference_price))
+            let fill_price = match order.side {
+                OrderSide::Buy => reference_price.min(limit_price),
+                OrderSide::Sell => reference_price.max(limit_price),
+            };
+
+            Ok(self.filled_report(order, order_id, fill_price))
         } else {
             self.open_orders.insert(order_id.clone(), order.clone());
             let remaining_quantity = order.quantity;
@@ -141,7 +146,7 @@ fn apply_slippage(reference_price: f64, side: OrderSide, slippage_bps: f64) -> f
     if side == OrderSide::Buy {
         reference_price * (1.0 + multiplier)
     } else {
-        reference_price * (1.0 - multiplier)
+        (reference_price * (1.0 - multiplier)).max(0.0)
     }
 }
 
@@ -228,6 +233,27 @@ mod tests {
 
         assert_eq!(report.status, OrderStatus::Accepted);
         assert_eq!(engine.open_order_count(), 1);
+    }
+
+    #[test]
+    fn marketable_limit_orders_respect_limit_price() {
+        let config = AppConfig::default();
+        let mut engine = PaperExecutionEngine::new(&config).expect("engine");
+        let order = OrderRequest::new(
+            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+            OrderSide::Sell,
+            OrderType::Limit,
+            1.0,
+        )
+        .and_then(|order| order.with_limit_price(99.0))
+        .expect("order");
+
+        let report = engine
+            .submit(order, Some(&sample_snapshot()))
+            .expect("report");
+
+        assert_eq!(report.status, OrderStatus::Filled);
+        assert_eq!(report.average_fill_price, Some(99.5));
     }
 
     #[test]

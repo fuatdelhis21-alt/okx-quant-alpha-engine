@@ -5,6 +5,7 @@ use qae_market_data::{
 };
 use qae_time::ExchangeTimestamp;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -311,8 +312,8 @@ fn parse_order_book(
         .bids
         .into_iter()
         .map(|level| {
-            let price = parse_f64(&level[0])?;
-            let quantity = parse_f64(&level[1])?;
+            let price = parse_f64(&level.0)?;
+            let quantity = parse_f64(&level.1)?;
             OrderBookLevel::new(price, quantity).map_err(WebsocketEngineError::MarketData)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -320,8 +321,8 @@ fn parse_order_book(
         .asks
         .into_iter()
         .map(|level| {
-            let price = parse_f64(&level[0])?;
-            let quantity = parse_f64(&level[1])?;
+            let price = parse_f64(&level.0)?;
+            let quantity = parse_f64(&level.1)?;
             OrderBookLevel::new(price, quantity).map_err(WebsocketEngineError::MarketData)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -374,11 +375,13 @@ struct TickerPayload {
 
 #[derive(Debug, Deserialize)]
 struct OrderBookPayload {
-    bids: Vec<[String; 4]>,
-    asks: Vec<[String; 4]>,
+    bids: Vec<RawOrderBookLevel>,
+    asks: Vec<RawOrderBookLevel>,
     ts: String,
     checksum: Option<String>,
 }
+
+type RawOrderBookLevel = (String, String, IgnoredAny, IgnoredAny);
 
 #[derive(Debug, Error)]
 pub enum WebsocketEngineError {
