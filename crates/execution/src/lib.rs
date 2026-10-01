@@ -175,16 +175,12 @@ impl OmsRuntime {
     pub fn apply_market_update(&mut self, update: MarketDataUpdate) {
         match update {
             MarketDataUpdate::Ticker(ticker) => {
-                self.snapshots
-                    .entry(ticker.instrument_id.clone())
-                    .or_default()
-                    .ticker = Some(ticker);
+                let instrument_id = ticker.instrument_id.clone();
+                self.snapshots.entry(instrument_id).or_default().ticker = Some(ticker);
             }
             MarketDataUpdate::OrderBook(order_book) => {
-                self.snapshots
-                    .entry(order_book.instrument_id.clone())
-                    .or_default()
-                    .order_book = Some(order_book);
+                let instrument_id = order_book.instrument_id.clone();
+                self.snapshots.entry(instrument_id).or_default().order_book = Some(order_book);
             }
         }
     }
@@ -214,7 +210,9 @@ impl OmsRuntime {
         match command {
             OmsCommand::Submit(order) => {
                 let snapshot = self.snapshots.get(&order.instrument_id);
-                self.gateway.submit(signer, order, snapshot, clock).map(Some)
+                self.gateway
+                    .submit(signer, order, snapshot, clock)
+                    .map(Some)
             }
             OmsCommand::Cancel(cancel) => self.gateway.cancel(signer, cancel, clock).map(Some),
         }
@@ -560,7 +558,9 @@ mod tests {
     use super::*;
     use chrono::{DateTime, TimeZone, Utc};
     use qae_core::{CancelOrderRequest, InstrumentId, OrderRequest, OrderSide, OrderType};
-    use qae_market_data::{MarketDataUpdate, MarketSnapshot, OrderBookLevel, OrderBookSnapshot, Ticker};
+    use qae_market_data::{
+        MarketDataUpdate, MarketSnapshot, OrderBookLevel, OrderBookSnapshot, Ticker,
+    };
     use qae_okx_client::HmacSha256Signer;
     use qae_time::ExchangeTimestamp;
 
@@ -928,7 +928,10 @@ mod tests {
             available_equity: 950.0,
         }));
 
-        assert_eq!(reconciliation.portfolio_risk.last_known_equity, Some(1_000.0));
+        assert_eq!(
+            reconciliation.portfolio_risk.last_known_equity,
+            Some(1_000.0)
+        );
         assert_eq!(
             reconciliation.portfolio_risk.last_known_available_equity,
             Some(950.0)

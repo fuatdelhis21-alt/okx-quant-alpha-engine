@@ -215,7 +215,8 @@ impl PortfolioRiskState {
     pub fn apply_account_balance(&mut self, balance: &AccountBalance) {
         self.last_known_equity = Some(balance.equity);
         self.last_known_available_equity = Some(balance.available_equity);
-        self.balances.insert(balance.currency.clone(), balance.clone());
+        self.balances
+            .insert(balance.currency.clone(), balance.clone());
     }
 
     pub fn apply_execution_report(&mut self, report: &ExecutionReport) {
@@ -317,7 +318,8 @@ impl PortfolioRiskState {
         if profile.net_quantity.abs() < f64::EPSILON {
             self.position_profiles.remove(&instrument_id);
         } else {
-            self.position_profiles.insert(instrument_id.clone(), profile);
+            self.position_profiles
+                .insert(instrument_id.clone(), profile);
         }
         self.set_position_notional(instrument_id, notional);
     }

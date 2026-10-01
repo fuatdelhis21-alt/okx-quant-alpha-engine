@@ -265,7 +265,7 @@ pub struct ExecutionReport {
     pub rejection_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountBalance {
     pub currency: String,
     pub equity: f64,
