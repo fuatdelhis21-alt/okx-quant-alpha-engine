@@ -11,7 +11,7 @@ use qae_risk::{PortfolioRiskManager, PortfolioRiskState, RiskManager, RiskViolat
 use qae_time::{SystemWallClock, WallClock};
 use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 #[derive(Debug)]
@@ -48,11 +48,28 @@ pub struct OmsRuntime {
 
 pub type OmsServiceOutcome = Result<ExecutionReport, ExecutionError>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OmsStateSnapshot {
+    pub cached_snapshots: usize,
+    pub snapshot_instruments: Vec<InstrumentId>,
+    pub pending_commands: usize,
+    pub open_orders: usize,
+    pub tracked_orders: usize,
+    pub tracked_balances: usize,
+    pub tracked_positions: usize,
+    pub tracked_fills: usize,
+    pub total_exposure_notional: f64,
+    pub daily_realized_pnl: f64,
+    pub last_known_equity: Option<f64>,
+    pub last_known_available_equity: Option<f64>,
+}
+
+#[derive(Debug)]
 enum OmsServiceMessage {
     Command(OmsCommand),
     MarketData(MarketDataUpdate),
     PrivateEvent(PrivateStreamEvent),
+    QueryState(oneshot::Sender<OmsStateSnapshot>),
     Shutdown,
 }
 
@@ -94,6 +111,9 @@ impl OmsService {
                         {
                             return Ok(());
                         }
+                    }
+                    OmsServiceMessage::QueryState(response_tx) => {
+                        let _ = response_tx.send(runtime.state_snapshot());
                     }
                     OmsServiceMessage::Shutdown => break,
                 }
@@ -143,6 +163,16 @@ impl OmsServiceHandle {
             .send(OmsServiceMessage::Shutdown)
             .await
             .map_err(|_| OmsServiceSendError::Closed)
+    }
+
+    pub async fn query_state(&self) -> Result<OmsStateSnapshot, OmsServiceQueryError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.message_tx
+            .send(OmsServiceMessage::QueryState(response_tx))
+            .await
+            .map_err(|_| OmsServiceQueryError::Closed)?;
+
+        response_rx.await.map_err(|_| OmsServiceQueryError::Closed)
     }
 }
 
@@ -341,6 +371,40 @@ impl OmsRuntime {
     #[must_use]
     pub fn gateway(&self) -> &ExecutionGateway {
         &self.gateway
+    }
+
+    #[must_use]
+    pub fn state_snapshot(&self) -> OmsStateSnapshot {
+        OmsStateSnapshot {
+            cached_snapshots: self.snapshots.len(),
+            snapshot_instruments: self.snapshots.keys().cloned().collect(),
+            pending_commands: self.pending_command_count(),
+            open_orders: self.gateway.open_orders().len(),
+            tracked_orders: self.gateway.reconciliation_state().order_records.len(),
+            tracked_balances: self.gateway.reconciliation_state().balances.len(),
+            tracked_positions: self.gateway.reconciliation_state().positions.len(),
+            tracked_fills: self.gateway.reconciliation_state().fills.len(),
+            total_exposure_notional: self
+                .gateway
+                .reconciliation_state()
+                .portfolio_risk
+                .total_exposure_notional,
+            daily_realized_pnl: self
+                .gateway
+                .reconciliation_state()
+                .portfolio_risk
+                .daily_realized_pnl,
+            last_known_equity: self
+                .gateway
+                .reconciliation_state()
+                .portfolio_risk
+                .last_known_equity,
+            last_known_available_equity: self
+                .gateway
+                .reconciliation_state()
+                .portfolio_risk
+                .last_known_available_equity,
+        }
     }
 }
 
@@ -663,6 +727,12 @@ pub enum OmsServiceSendError {
     Closed,
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum OmsServiceQueryError {
+    #[error("oms service is not running")]
+    Closed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,6 +845,73 @@ mod tests {
             .expect("outcome")
             .expect("execution report");
         assert_eq!(report.status, OrderStatus::Filled);
+
+        handle.shutdown().await.expect("shutdown sent");
+        task.await.expect("task join").expect("task result");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oms_service_reports_runtime_state() {
+        let service = OmsService::spawn(AppConfig::default()).expect("service");
+        let handle = service.handle.clone();
+        let task = service.task;
+        let instrument_id = InstrumentId::new("BTC-USDT-SWAP").expect("instrument");
+
+        handle
+            .publish_market_update(MarketDataUpdate::Ticker(
+                Ticker::new(
+                    instrument_id.clone(),
+                    100.0,
+                    99.5,
+                    100.5,
+                    ExchangeTimestamp::from_millis(1_700_000_000_000),
+                )
+                .expect("ticker"),
+            ))
+            .await
+            .expect("ticker sent");
+        handle
+            .publish_market_update(MarketDataUpdate::OrderBook(
+                OrderBookSnapshot::new(
+                    instrument_id.clone(),
+                    vec![OrderBookLevel::new(99.5, 1.0).expect("bid")],
+                    vec![OrderBookLevel::new(100.5, 1.0).expect("ask")],
+                    None,
+                    ExchangeTimestamp::from_millis(1_700_000_000_000),
+                )
+                .expect("book"),
+            ))
+            .await
+            .expect("book sent");
+        handle
+            .submit_command(OmsCommand::Submit(
+                OrderRequest::new(instrument_id.clone(), OrderSide::Buy, OrderType::Limit, 1.0)
+                    .expect("order")
+                    .with_limit_price(99.0)
+                    .expect("limit"),
+            ))
+            .await
+            .expect("command sent");
+        handle
+            .publish_private_event(PrivateStreamEvent::Account(AccountBalance {
+                currency: "USDT".to_string(),
+                equity: 1_000.0,
+                available_equity: 900.0,
+            }))
+            .await
+            .expect("account sent");
+
+        let state = handle.query_state().await.expect("state");
+        assert_eq!(state.cached_snapshots, 1);
+        assert_eq!(state.snapshot_instruments, vec![instrument_id]);
+        assert_eq!(state.pending_commands, 0);
+        assert_eq!(state.open_orders, 1);
+        assert_eq!(state.tracked_orders, 1);
+        assert_eq!(state.tracked_balances, 1);
+        assert_eq!(state.tracked_positions, 0);
+        assert_eq!(state.tracked_fills, 0);
+        assert_eq!(state.last_known_equity, Some(1_000.0));
+        assert_eq!(state.last_known_available_equity, Some(900.0));
 
         handle.shutdown().await.expect("shutdown sent");
         task.await.expect("task join").expect("task result");

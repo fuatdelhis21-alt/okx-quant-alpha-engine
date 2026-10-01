@@ -124,6 +124,10 @@ async fn main() -> Result<()> {
     }
 
     processed_outcomes += drain_oms_outcomes(&mut oms_service.outcomes, &mut strategy);
+    let oms_state = oms_handle
+        .query_state()
+        .await
+        .context("failed to query oms service state")?;
     oms_handle
         .shutdown()
         .await
@@ -134,7 +138,16 @@ async fn main() -> Result<()> {
         .context("failed to join oms service task")?
         .context("oms service exited with error")?;
 
-    info!(processed_outcomes, "oms service shutdown completed");
+    info!(
+        processed_outcomes,
+        cached_snapshots = oms_state.cached_snapshots,
+        open_orders = oms_state.open_orders,
+        tracked_orders = oms_state.tracked_orders,
+        tracked_balances = oms_state.tracked_balances,
+        tracked_positions = oms_state.tracked_positions,
+        tracked_fills = oms_state.tracked_fills,
+        "oms service shutdown completed"
+    );
 
     Ok(())
 }
