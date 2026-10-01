@@ -14,10 +14,10 @@ The repository currently delivers a safe-by-default foundation plus the next sca
 - Market data subscription planning and OKX frame parsing scaffolding
 - Market snapshot caching for tickers and order books with incremental merge/checksum validation
 - Risk guardrails for staged order requests
-- Paper/simulation execution scaffolding plus normalized live REST order submission
+- Paper/simulation execution scaffolding plus normalized live REST order submission and cancellation
 - Optional authenticated private WebSocket startup login, subscription, and private event parsing flow
 
-The repository still does not include a full OMS/strategy layer, but live order acknowledgements and private stream events now flow through shared execution-report types.
+The repository still does not include a full OMS/strategy layer, but live order acknowledgements, cancellations, and private stream events now flow through shared execution-report types.
 
 ## Workspace structure
 
@@ -26,9 +26,9 @@ The repository still does not include a full OMS/strategy layer, but live order 
 - `crates/market-data`: ticker/order-book domain types and snapshot helpers
 - `crates/time`: wall clock, exchange timestamp, monotonic elapsed timing, offset state scaffolding
 - `crates/monitoring`: tracing initialization and secret-safe helpers
-- `crates/okx-client`: OKX V5 request/signing foundation, websocket login, and live order submission transport
+- `crates/okx-client`: OKX V5 request/signing foundation, websocket login, and live order submit/cancel transport
 - `crates/risk`: order guardrails plus portfolio-risk state scaffolding
-- `crates/execution`: paper/simulation order submission flow, live execution gateway, and reconciliation state
+- `crates/execution`: paper/simulation order lifecycle flow, live execution gateway, and reconciliation state
 - `crates/websocket-engine`: bounded-channel engine scaffolding, reconnect/backoff, heartbeat, subscriptions, parsing, private event ingestion, and snapshot cache
 - `apps/trader`: startup binary wiring config + monitoring + websocket/risk/execution scaffolding
 

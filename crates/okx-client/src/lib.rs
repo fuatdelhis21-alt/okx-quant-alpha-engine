@@ -3,7 +3,8 @@ use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, Mac};
 use qae_config::{AppConfig, WsEndpointKind};
 use qae_core::{
-    ExecutionReport, OrderRequest, OrderSide, OrderStatus, OrderType, RequestPriority, RuntimeMode,
+    CancelOrderRequest, ExecutionReport, OrderRequest, OrderSide, OrderStatus, OrderType,
+    RequestPriority, RuntimeMode,
 };
 use qae_time::{ExchangeTimestamp, WallClock};
 use reqwest::blocking::Client;
@@ -21,6 +22,7 @@ pub const OKX_ACCESS_PASSPHRASE: &str = "OK-ACCESS-PASSPHRASE";
 pub const OKX_SIMULATED_TRADING: &str = "x-simulated-trading";
 pub const OKX_WS_LOGIN_PATH: &str = "/users/self/verify";
 pub const OKX_ORDER_PATH: &str = "/api/v5/trade/order";
+pub const OKX_CANCEL_ORDER_PATH: &str = "/api/v5/trade/cancel-order";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -120,6 +122,32 @@ impl OkxClient {
         self.build_authenticated_request(signer, request, clock)
     }
 
+    pub fn build_cancel_order_request(
+        &self,
+        cancel: &CancelOrderRequest,
+    ) -> Result<RestRequest, OkxClientError> {
+        cancel
+            .validate()
+            .map_err(|error| OkxClientError::InvalidCancelOrder(error.to_string()))?;
+
+        let body = serde_json::to_string(&OkxCancelOrderBody::from(cancel))
+            .map_err(OkxClientError::SerializePayload)?;
+
+        Ok(RestRequest::new("POST", OKX_CANCEL_ORDER_PATH)
+            .with_priority(RequestPriority::High)
+            .with_body(body))
+    }
+
+    pub fn build_signed_cancel_order_request<C: WallClock>(
+        &self,
+        signer: &impl RequestSigner,
+        cancel: &CancelOrderRequest,
+        clock: &C,
+    ) -> Result<SignedRequest, OkxClientError> {
+        let request = self.build_cancel_order_request(cancel)?;
+        self.build_authenticated_request(signer, request, clock)
+    }
+
     pub fn submit_live_order<C: WallClock, T: LiveOrderTransport>(
         &self,
         transport: &T,
@@ -138,6 +166,27 @@ impl OkxClient {
             self.config.network.request_timeout_ms,
         )?;
         parse_order_submission_response(&body, order)
+    }
+
+    pub fn cancel_live_order<C: WallClock, T: LiveOrderTransport>(
+        &self,
+        transport: &T,
+        signer: &impl RequestSigner,
+        cancel: &CancelOrderRequest,
+        existing_report: Option<&ExecutionReport>,
+        clock: &C,
+    ) -> Result<ExecutionReport, OkxClientError> {
+        if !self.config.live_trading || self.config.mode != RuntimeMode::Live {
+            return Err(OkxClientError::LiveTradingDisabled);
+        }
+
+        let request = self.build_signed_cancel_order_request(signer, cancel, clock)?;
+        let body = transport.execute(
+            self.rest_endpoint(),
+            &request,
+            self.config.network.request_timeout_ms,
+        )?;
+        parse_cancel_order_response(&body, cancel, existing_report)
     }
 
     pub fn request_withdrawal_stub(&self) -> Result<(), OkxClientError> {
@@ -313,6 +362,26 @@ impl<'a> From<&'a OrderRequest> for OkxOrderBody<'a> {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct OkxCancelOrderBody<'a> {
+    #[serde(rename = "instId")]
+    inst_id: &'a str,
+    #[serde(rename = "ordId", skip_serializing_if = "Option::is_none")]
+    ord_id: Option<&'a str>,
+    #[serde(rename = "clOrdId", skip_serializing_if = "Option::is_none")]
+    cl_ord_id: Option<&'a str>,
+}
+
+impl<'a> From<&'a CancelOrderRequest> for OkxCancelOrderBody<'a> {
+    fn from(cancel: &'a CancelOrderRequest) -> Self {
+        Self {
+            inst_id: cancel.instrument_id.as_str(),
+            ord_id: cancel.order_id.as_deref(),
+            cl_ord_id: cancel.client_order_id.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct OkxEnvelope<T> {
     code: String,
@@ -403,6 +472,60 @@ fn parse_order_submission_response(
     })
 }
 
+fn parse_cancel_order_response(
+    body: &str,
+    cancel: &CancelOrderRequest,
+    existing_report: Option<&ExecutionReport>,
+) -> Result<ExecutionReport, OkxClientError> {
+    let envelope: OkxEnvelope<OkxOrderAck> =
+        serde_json::from_str(body).map_err(OkxClientError::DeserializePayload)?;
+    if envelope.code != "0" {
+        return Err(OkxClientError::ApiRejected {
+            code: envelope.code,
+            message: envelope.msg,
+        });
+    }
+
+    let ack = envelope
+        .data
+        .into_iter()
+        .next()
+        .ok_or(OkxClientError::MissingOrderAck)?;
+    if ack.status_code.as_deref().unwrap_or("0") != "0" {
+        return Err(OkxClientError::ApiRejected {
+            code: ack.status_code.unwrap_or_else(|| "unknown".to_string()),
+            message: ack
+                .status_message
+                .unwrap_or_else(|| "order cancellation rejected".to_string()),
+        });
+    }
+
+    Ok(ExecutionReport {
+        order_id: ack
+            .ord_id
+            .clone()
+            .or_else(|| existing_report.map(|report| report.order_id.clone()))
+            .or_else(|| cancel.order_id.clone())
+            .or_else(|| ack.cl_ord_id.clone())
+            .or_else(|| cancel.client_order_id.clone())
+            .unwrap_or_else(|| cancel.instrument_id.to_string()),
+        client_order_id: ack
+            .cl_ord_id
+            .or_else(|| existing_report.and_then(|report| report.client_order_id.clone()))
+            .or_else(|| cancel.client_order_id.clone()),
+        venue_order_id: ack
+            .ord_id
+            .or_else(|| existing_report.and_then(|report| report.venue_order_id.clone()))
+            .or_else(|| cancel.order_id.clone()),
+        instrument_id: cancel.instrument_id.clone(),
+        status: OrderStatus::Cancelled,
+        filled_quantity: existing_report.map_or(0.0, |report| report.filled_quantity),
+        remaining_quantity: existing_report.map_or(0.0, |report| report.remaining_quantity),
+        average_fill_price: existing_report.and_then(|report| report.average_fill_price),
+        rejection_reason: None,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum OkxClientError {
     #[error("api credentials are required for authenticated requests")]
@@ -431,6 +554,8 @@ pub enum OkxClientError {
     UnsupportedLiveOperation(&'static str),
     #[error("invalid order request: {0}")]
     InvalidOrder(String),
+    #[error("invalid cancel order request: {0}")]
+    InvalidCancelOrder(String),
     #[error("OKX API rejected request ({code}): {message}")]
     ApiRejected { code: String, message: String },
     #[error("order submission response did not include an acknowledgement")]
@@ -573,6 +698,37 @@ mod tests {
     }
 
     #[test]
+    fn builds_signed_cancel_order_request() {
+        let mut cfg = AppConfig::default();
+        cfg.okx.credentials = ApiCredentials {
+            api_key: Some("k".into()),
+            api_secret: Some("s".into()),
+            passphrase: Some("p".into()),
+        };
+
+        let cancel = CancelOrderRequest::new(
+            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+        )
+        .with_client_order_id("cid-1");
+
+        let signed = OkxClient::new(cfg)
+            .build_signed_cancel_order_request(
+                &HmacSha256Signer,
+                &cancel,
+                &FixedClock(
+                    Utc.timestamp_millis_opt(1_700_000_000_000)
+                        .single()
+                        .expect("valid ts"),
+                ),
+            )
+            .expect("signed request");
+
+        assert_eq!(signed.request.path, OKX_CANCEL_ORDER_PATH);
+        assert!(signed.request.body.contains(r#""instId":"BTC-USDT-SWAP""#));
+        assert!(signed.request.body.contains(r#""clOrdId":"cid-1""#));
+    }
+
+    #[test]
     fn submits_live_order_and_parses_ack() {
         let mut cfg = AppConfig {
             mode: RuntimeMode::Live,
@@ -614,5 +770,59 @@ mod tests {
         assert_eq!(report.client_order_id.as_deref(), Some("cid-7"));
         assert_eq!(report.venue_order_id.as_deref(), Some("42"));
         assert_eq!(report.status, OrderStatus::Accepted);
+    }
+
+    #[test]
+    fn cancels_live_order_and_preserves_existing_quantities() {
+        let mut cfg = AppConfig {
+            mode: RuntimeMode::Live,
+            live_trading: true,
+            ..AppConfig::default()
+        };
+        cfg.okx.credentials = ApiCredentials {
+            api_key: Some("k".into()),
+            api_secret: Some("s".into()),
+            passphrase: Some("p".into()),
+        };
+
+        let cancel = CancelOrderRequest::new(
+            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+        )
+        .with_order_id("42")
+        .with_client_order_id("cid-7");
+        let existing = ExecutionReport {
+            order_id: "42".to_string(),
+            client_order_id: Some("cid-7".to_string()),
+            venue_order_id: Some("42".to_string()),
+            instrument_id: InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+            status: OrderStatus::PartiallyFilled,
+            filled_quantity: 0.5,
+            remaining_quantity: 0.5,
+            average_fill_price: Some(100.0),
+            rejection_reason: None,
+        };
+
+        let report = OkxClient::new(cfg)
+            .cancel_live_order(
+                &MockTransport {
+                    response: r#"{"code":"0","msg":"","data":[{"ordId":"42","clOrdId":"cid-7","sCode":"0","sMsg":""}]}"#.to_string(),
+                },
+                &HmacSha256Signer,
+                &cancel,
+                Some(&existing),
+                &FixedClock(
+                    Utc.timestamp_millis_opt(1_700_000_000_000)
+                        .single()
+                        .expect("valid ts"),
+                ),
+            )
+            .expect("report");
+
+        assert_eq!(report.order_id, "42");
+        assert_eq!(report.client_order_id.as_deref(), Some("cid-7"));
+        assert_eq!(report.status, OrderStatus::Cancelled);
+        assert_eq!(report.filled_quantity, 0.5);
+        assert_eq!(report.remaining_quantity, 0.5);
+        assert_eq!(report.average_fill_price, Some(100.0));
     }
 }

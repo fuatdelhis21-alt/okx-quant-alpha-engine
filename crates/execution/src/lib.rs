@@ -1,7 +1,7 @@
 use qae_config::AppConfig;
 use qae_core::{
-    AccountBalance, ExecutionReport, FillUpdate, OrderRequest, OrderStatus, PositionUpdate,
-    PrivateStreamEvent, RuntimeMode,
+    AccountBalance, CancelOrderRequest, ExecutionReport, FillUpdate, OrderRequest, OrderStatus,
+    PositionUpdate, PrivateStreamEvent, RuntimeMode,
 };
 use qae_market_data::MarketSnapshot;
 use qae_okx_client::{OkxClient, OkxClientError, RequestSigner, ReqwestLiveOrderTransport};
@@ -77,6 +77,44 @@ impl ExecutionGateway {
 
     pub fn apply_private_event(&mut self, event: PrivateStreamEvent) -> Option<ExecutionReport> {
         self.reconciliation.apply_private_event(event)
+    }
+
+    pub fn cancel<C: WallClock>(
+        &mut self,
+        signer: &impl RequestSigner,
+        cancel: CancelOrderRequest,
+        clock: &C,
+    ) -> Result<ExecutionReport, ExecutionError> {
+        let existing_report = self
+            .reconciliation
+            .find_report(&cancel)
+            .cloned()
+            .ok_or_else(|| ExecutionError::OrderNotFound(cancel.instrument_id.to_string()))?;
+
+        if !status_is_open(existing_report.status) {
+            return Err(ExecutionError::OrderNotCancellable(existing_report.order_id));
+        }
+
+        let report = match self.mode {
+            RuntimeMode::Paper | RuntimeMode::Simulation => self
+                .reconciliation
+                .cancel_open_order(cancel, existing_report)?,
+            RuntimeMode::Live => {
+                if self.transport.is_none() {
+                    self.transport =
+                        Some(ReqwestLiveOrderTransport::new().map_err(ExecutionError::Okx)?);
+                }
+                let transport = self.transport.as_ref().expect("transport initialized");
+                let report = self
+                    .okx_client
+                    .cancel_live_order(transport, signer, &cancel, Some(&existing_report), clock)
+                    .map_err(ExecutionError::Okx)?;
+                self.reconciliation.upsert_report(report.clone());
+                report
+            }
+        };
+
+        Ok(report)
     }
 
     #[must_use]
@@ -165,6 +203,11 @@ impl ReconciliationState {
         }
     }
 
+    pub fn find_report(&self, cancel: &CancelOrderRequest) -> Option<&ExecutionReport> {
+        self.resolve_report_key(cancel)
+            .and_then(|report_key| self.reports.get(&report_key))
+    }
+
     fn upsert_report(&mut self, report: ExecutionReport) {
         let previous_open = self
             .reports
@@ -184,6 +227,37 @@ impl ReconciliationState {
                 .insert(client_order_id, report.order_id.clone());
         }
         self.reports.insert(report.order_id.clone(), report);
+    }
+
+    fn cancel_open_order(
+        &mut self,
+        cancel: CancelOrderRequest,
+        existing_report: ExecutionReport,
+    ) -> Result<ExecutionReport, ExecutionError> {
+        self.resolve_report_key(&cancel)
+            .ok_or_else(|| ExecutionError::OrderNotFound(cancel.instrument_id.to_string()))?;
+        let mut updated = existing_report;
+        updated.status = OrderStatus::Cancelled;
+        self.upsert_report(updated.clone());
+        Ok(updated)
+    }
+
+    fn resolve_report_key(&self, cancel: &CancelOrderRequest) -> Option<String> {
+        cancel
+            .order_id
+            .as_ref()
+            .and_then(|order_id| {
+                if self.reports.contains_key(order_id) {
+                    Some(order_id.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                cancel.client_order_id.as_ref().and_then(|client_order_id| {
+                    self.reports_by_client_order_id.get(client_order_id).cloned()
+                })
+            })
     }
 }
 
@@ -321,13 +395,17 @@ pub enum ExecutionError {
     PortfolioRiskConfig(#[source] qae_risk::RiskError),
     #[error("failed to interact with OKX client: {0}")]
     Okx(#[from] OkxClientError),
+    #[error("order was not found for cancellation: {0}")]
+    OrderNotFound(String),
+    #[error("order is not cancellable: {0}")]
+    OrderNotCancellable(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{DateTime, TimeZone, Utc};
-    use qae_core::{InstrumentId, OrderRequest, OrderSide, OrderType};
+    use qae_core::{CancelOrderRequest, InstrumentId, OrderRequest, OrderSide, OrderType};
     use qae_market_data::{MarketSnapshot, OrderBookLevel, OrderBookSnapshot, Ticker};
     use qae_okx_client::HmacSha256Signer;
     use qae_time::ExchangeTimestamp;
@@ -528,5 +606,52 @@ mod tests {
         assert!(updated);
         assert_eq!(reconciliation.fills.len(), 1);
         assert_eq!(reconciliation.reports["ord-1"].status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn gateway_cancels_open_paper_orders() {
+        let config = AppConfig::default();
+        let mut gateway = ExecutionGateway::new(&config).expect("gateway");
+        let order = OrderRequest::new(
+            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            1.0,
+        )
+        .and_then(|order| order.with_limit_price(99.0))
+        .expect("order")
+        .with_client_order_id("cid-cancel");
+
+        let report = gateway
+            .submit(
+                &HmacSha256Signer,
+                order,
+                Some(&sample_snapshot()),
+                &FixedClock(
+                    Utc.timestamp_millis_opt(1_700_000_000_000)
+                        .single()
+                        .expect("ts"),
+                ),
+            )
+            .expect("submit");
+        assert_eq!(report.status, OrderStatus::Accepted);
+
+        let cancelled = gateway
+            .cancel(
+                &HmacSha256Signer,
+                CancelOrderRequest::new(
+                    InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+                )
+                .with_client_order_id("cid-cancel"),
+                &FixedClock(
+                    Utc.timestamp_millis_opt(1_700_000_000_001)
+                        .single()
+                        .expect("ts"),
+                ),
+            )
+            .expect("cancel");
+
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+        assert_eq!(gateway.reconciliation_state().portfolio_risk.open_orders, 0);
     }
 }

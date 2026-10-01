@@ -189,6 +189,58 @@ pub enum OrderRequestError {
     InvalidLimitPrice(f64),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelOrderRequest {
+    pub instrument_id: InstrumentId,
+    pub order_id: Option<String>,
+    pub client_order_id: Option<String>,
+}
+
+impl CancelOrderRequest {
+    #[must_use]
+    pub fn new(instrument_id: InstrumentId) -> Self {
+        Self {
+            instrument_id,
+            order_id: None,
+            client_order_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_order_id(mut self, order_id: impl Into<String>) -> Self {
+        self.order_id = Some(order_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_client_order_id(mut self, client_order_id: impl Into<String>) -> Self {
+        self.client_order_id = Some(client_order_id.into());
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), CancelOrderRequestError> {
+        if self
+            .order_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+            && self
+                .client_order_id
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(CancelOrderRequestError::MissingIdentifier);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum CancelOrderRequestError {
+    #[error("cancel requests require either an order id or client order id")]
+    MissingIdentifier,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderStatus {
@@ -367,5 +419,16 @@ mod tests {
 
         assert_eq!(order.limit_price, Some(42.0));
         assert!(order.validate().is_ok());
+    }
+
+    #[test]
+    fn cancel_order_requires_identifier() {
+        let request =
+            CancelOrderRequest::new(InstrumentId::new("BTC-USDT-SWAP").expect("instrument"));
+
+        assert_eq!(
+            request.validate().err(),
+            Some(CancelOrderRequestError::MissingIdentifier)
+        );
     }
 }
