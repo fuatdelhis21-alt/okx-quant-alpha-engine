@@ -235,7 +235,9 @@ impl ReconciliationState {
 
     #[must_use]
     pub fn current_report(&self, order_id: &str) -> Option<&ExecutionReport> {
-        self.order_records.get(order_id).map(|record| &record.current)
+        self.order_records
+            .get(order_id)
+            .map(|record| &record.current)
     }
 
     #[must_use]
@@ -741,7 +743,9 @@ mod tests {
 
         assert_eq!(gateway.open_orders().len(), 1);
         assert_eq!(
-            gateway.current_report(&submitted.order_id).map(|report| report.status),
+            gateway
+                .current_report(&submitted.order_id)
+                .map(|report| report.status),
             Some(OrderStatus::Accepted)
         );
 
