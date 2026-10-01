@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use qae_config::AppConfig;
-use qae_execution::ExecutionGateway;
+use qae_execution::OmsRuntime;
 use qae_monitoring::{MonitoringConfig, init_tracing};
 use qae_okx_client::{HmacSha256Signer, OkxClient};
 use qae_risk::RiskManager;
@@ -23,8 +23,8 @@ async fn main() -> Result<()> {
     let mut websocket_engine =
         WebsocketEngine::new(&config).context("websocket engine configuration invalid")?;
     let risk_manager = RiskManager::new(&config).context("risk manager configuration invalid")?;
-    let mut execution_gateway =
-        ExecutionGateway::new(&config).context("execution gateway configuration invalid")?;
+    let mut oms_runtime =
+        OmsRuntime::new(&config).context("execution gateway configuration invalid")?;
 
     info!(
         state = ?websocket_engine.state,
@@ -44,6 +44,10 @@ async fn main() -> Result<()> {
             )
             .await
             .context("failed to collect public websocket updates")?;
+
+        for update in updates.iter().cloned() {
+            oms_runtime.apply_market_update(update);
+        }
 
         info!(
             received_updates = updates.len(),
@@ -81,7 +85,7 @@ async fn main() -> Result<()> {
             .context("failed to authenticate private websocket stream")?;
 
         for event in events {
-            if let Some(report) = execution_gateway.apply_private_event(event) {
+            if let Some(report) = oms_runtime.apply_private_event(event) {
                 info!(order_id = %report.order_id, status = ?report.status, "reconciled private order event");
             }
         }
@@ -90,6 +94,12 @@ async fn main() -> Result<()> {
     } else {
         info!("private websocket startup session disabled by configuration");
     }
+
+    info!(
+        pending_commands = oms_runtime.pending_command_count(),
+        open_orders = oms_runtime.gateway().open_orders().len(),
+        "oms runtime initialized"
+    );
 
     Ok(())
 }

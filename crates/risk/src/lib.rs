@@ -1,7 +1,7 @@
 use qae_config::AppConfig;
 use qae_core::{
-    ExecutionReport, FillUpdate, InstrumentId, OrderRequest, OrderSide, OrderStatus, OrderType,
-    PositionUpdate,
+    AccountBalance, ExecutionReport, FillUpdate, InstrumentId, OrderRequest, OrderSide,
+    OrderStatus, OrderType, PositionUpdate,
 };
 use qae_market_data::MarketSnapshot;
 use std::collections::BTreeMap;
@@ -169,9 +169,20 @@ impl PortfolioRiskManager {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PortfolioRiskState {
     pub position_notionals: BTreeMap<InstrumentId, f64>,
+    pub position_profiles: BTreeMap<InstrumentId, PositionRiskProfile>,
+    pub balances: BTreeMap<String, AccountBalance>,
     pub total_exposure_notional: f64,
     pub daily_realized_pnl: f64,
     pub open_orders: u32,
+    pub last_known_equity: Option<f64>,
+    pub last_known_available_equity: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PositionRiskProfile {
+    pub net_quantity: f64,
+    pub average_entry_price: Option<f64>,
+    pub realized_pnl: f64,
 }
 
 impl PortfolioRiskState {
@@ -196,6 +207,17 @@ impl PortfolioRiskState {
         self.daily_realized_pnl = pnl;
     }
 
+    #[must_use]
+    pub fn position_profile(&self, instrument_id: &InstrumentId) -> Option<&PositionRiskProfile> {
+        self.position_profiles.get(instrument_id)
+    }
+
+    pub fn apply_account_balance(&mut self, balance: &AccountBalance) {
+        self.last_known_equity = Some(balance.equity);
+        self.last_known_available_equity = Some(balance.available_equity);
+        self.balances.insert(balance.currency.clone(), balance.clone());
+    }
+
     pub fn apply_execution_report(&mut self, report: &ExecutionReport) {
         match report.status {
             OrderStatus::Submitted | OrderStatus::Accepted | OrderStatus::PartiallyFilled => {
@@ -208,23 +230,96 @@ impl PortfolioRiskState {
     }
 
     pub fn apply_position_update(&mut self, update: &PositionUpdate) {
+        let signed_quantity = if update.side == OrderSide::Buy {
+            update.quantity.abs()
+        } else {
+            -update.quantity.abs()
+        };
+        let realized_pnl = self
+            .position_profiles
+            .get(&update.instrument_id)
+            .map_or(0.0, |profile| profile.realized_pnl);
+        self.upsert_position_profile(
+            update.instrument_id.clone(),
+            PositionRiskProfile {
+                net_quantity: signed_quantity,
+                average_entry_price: update.average_entry_price,
+                realized_pnl,
+            },
+        );
         let notional = update.average_entry_price.unwrap_or_default() * update.quantity.abs();
         self.set_position_notional(update.instrument_id.clone(), notional);
     }
 
     pub fn apply_fill_update(&mut self, fill: &FillUpdate) {
-        let current = self.position_notional(&fill.instrument_id);
-        let delta = fill.fill_price * fill.fill_quantity.abs();
-        let next = if fill.side == OrderSide::Buy {
-            current + delta
+        let mut profile = self
+            .position_profiles
+            .get(&fill.instrument_id)
+            .cloned()
+            .unwrap_or_default();
+        let signed_fill_quantity = if fill.side == OrderSide::Buy {
+            fill.fill_quantity.abs()
         } else {
-            (current - delta).max(0.0)
+            -fill.fill_quantity.abs()
         };
-        self.set_position_notional(fill.instrument_id.clone(), next);
+
+        if profile.net_quantity.abs() < f64::EPSILON
+            || profile.net_quantity.signum() == signed_fill_quantity.signum()
+        {
+            let current_abs_quantity = profile.net_quantity.abs();
+            let next_abs_quantity = current_abs_quantity + fill.fill_quantity.abs();
+            let average_entry = profile.average_entry_price.unwrap_or(fill.fill_price);
+            let next_average_entry = if next_abs_quantity > 0.0 {
+                ((average_entry * current_abs_quantity)
+                    + (fill.fill_price * fill.fill_quantity.abs()))
+                    / next_abs_quantity
+            } else {
+                fill.fill_price
+            };
+
+            profile.net_quantity += signed_fill_quantity;
+            profile.average_entry_price = Some(next_average_entry);
+        } else {
+            let current_abs_quantity = profile.net_quantity.abs();
+            let closing_quantity = current_abs_quantity.min(fill.fill_quantity.abs());
+            let entry_price = profile.average_entry_price.unwrap_or(fill.fill_price);
+            let realized_delta = if profile.net_quantity > 0.0 {
+                (fill.fill_price - entry_price) * closing_quantity
+            } else {
+                (entry_price - fill.fill_price) * closing_quantity
+            };
+
+            profile.realized_pnl += realized_delta;
+            self.daily_realized_pnl += realized_delta;
+            profile.net_quantity += signed_fill_quantity;
+
+            if profile.net_quantity.abs() < f64::EPSILON {
+                profile.net_quantity = 0.0;
+                profile.average_entry_price = None;
+            } else if profile.net_quantity.signum() == signed_fill_quantity.signum() {
+                profile.average_entry_price = Some(fill.fill_price);
+            }
+        }
+
+        self.upsert_position_profile(fill.instrument_id.clone(), profile);
     }
 
     fn recompute_total_exposure(&mut self) {
         self.total_exposure_notional = self.position_notionals.values().sum();
+    }
+
+    fn upsert_position_profile(
+        &mut self,
+        instrument_id: InstrumentId,
+        profile: PositionRiskProfile,
+    ) {
+        let notional = profile.net_quantity.abs() * profile.average_entry_price.unwrap_or_default();
+        if profile.net_quantity.abs() < f64::EPSILON {
+            self.position_profiles.remove(&instrument_id);
+        } else {
+            self.position_profiles.insert(instrument_id.clone(), profile);
+        }
+        self.set_position_notional(instrument_id, notional);
     }
 }
 
@@ -399,5 +494,51 @@ mod tests {
         });
 
         assert_eq!(state.total_exposure_notional, 200.0);
+    }
+
+    #[test]
+    fn portfolio_state_tracks_realized_pnl_from_fills() {
+        let instrument_id = InstrumentId::new("BTC-USDT-SWAP").expect("instrument");
+        let mut state = PortfolioRiskState::default();
+
+        state.apply_fill_update(&FillUpdate {
+            order_id: "buy-1".to_string(),
+            client_order_id: Some("cid-buy-1".to_string()),
+            instrument_id: instrument_id.clone(),
+            side: OrderSide::Buy,
+            fill_price: 100.0,
+            fill_quantity: 2.0,
+        });
+        state.apply_fill_update(&FillUpdate {
+            order_id: "sell-1".to_string(),
+            client_order_id: Some("cid-sell-1".to_string()),
+            instrument_id: instrument_id.clone(),
+            side: OrderSide::Sell,
+            fill_price: 110.0,
+            fill_quantity: 1.0,
+        });
+
+        assert_eq!(state.daily_realized_pnl, 10.0);
+        assert_eq!(state.total_exposure_notional, 100.0);
+        assert_eq!(
+            state
+                .position_profile(&instrument_id)
+                .map(|profile| profile.net_quantity),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn portfolio_state_tracks_account_balances() {
+        let mut state = PortfolioRiskState::default();
+        state.apply_account_balance(&AccountBalance {
+            currency: "USDT".to_string(),
+            equity: 1_000.0,
+            available_equity: 900.0,
+        });
+
+        assert_eq!(state.last_known_equity, Some(1_000.0));
+        assert_eq!(state.last_known_available_equity, Some(900.0));
+        assert!(state.balances.contains_key("USDT"));
     }
 }

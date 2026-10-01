@@ -1,13 +1,13 @@
 use qae_config::AppConfig;
 use qae_core::{
-    AccountBalance, CancelOrderRequest, ExecutionReport, FillUpdate, OrderRequest, OrderStatus,
-    PositionUpdate, PrivateStreamEvent, RuntimeMode,
+    AccountBalance, CancelOrderRequest, ExecutionReport, FillUpdate, InstrumentId, OrderRequest,
+    OrderStatus, PositionUpdate, PrivateStreamEvent, RuntimeMode,
 };
-use qae_market_data::MarketSnapshot;
+use qae_market_data::{MarketDataUpdate, MarketSnapshot};
 use qae_okx_client::{OkxClient, OkxClientError, RequestSigner, ReqwestLiveOrderTransport};
 use qae_risk::{PortfolioRiskManager, PortfolioRiskState, RiskManager, RiskViolation};
 use qae_time::WallClock;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
 
 #[derive(Debug)]
@@ -27,6 +27,19 @@ pub struct ExecutionGateway {
     portfolio_risk: PortfolioRiskManager,
     reconciliation: ReconciliationState,
     next_live_client_order_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum OmsCommand {
+    Submit(OrderRequest),
+    Cancel(CancelOrderRequest),
+}
+
+#[derive(Debug)]
+pub struct OmsRuntime {
+    gateway: ExecutionGateway,
+    snapshots: BTreeMap<InstrumentId, MarketSnapshot>,
+    pending_commands: VecDeque<OmsCommand>,
 }
 
 impl ExecutionGateway {
@@ -150,6 +163,85 @@ impl ExecutionGateway {
     }
 }
 
+impl OmsRuntime {
+    pub fn new(config: &AppConfig) -> Result<Self, ExecutionError> {
+        Ok(Self {
+            gateway: ExecutionGateway::new(config)?,
+            snapshots: BTreeMap::new(),
+            pending_commands: VecDeque::new(),
+        })
+    }
+
+    pub fn apply_market_update(&mut self, update: MarketDataUpdate) {
+        match update {
+            MarketDataUpdate::Ticker(ticker) => {
+                self.snapshots
+                    .entry(ticker.instrument_id.clone())
+                    .or_default()
+                    .ticker = Some(ticker);
+            }
+            MarketDataUpdate::OrderBook(order_book) => {
+                self.snapshots
+                    .entry(order_book.instrument_id.clone())
+                    .or_default()
+                    .order_book = Some(order_book);
+            }
+        }
+    }
+
+    pub fn apply_private_event(&mut self, event: PrivateStreamEvent) -> Option<ExecutionReport> {
+        self.gateway.apply_private_event(event)
+    }
+
+    pub fn enqueue(&mut self, command: OmsCommand) {
+        self.pending_commands.push_back(command);
+    }
+
+    #[must_use]
+    pub fn pending_command_count(&self) -> usize {
+        self.pending_commands.len()
+    }
+
+    pub fn process_next<C: WallClock>(
+        &mut self,
+        signer: &impl RequestSigner,
+        clock: &C,
+    ) -> Result<Option<ExecutionReport>, ExecutionError> {
+        let Some(command) = self.pending_commands.pop_front() else {
+            return Ok(None);
+        };
+
+        match command {
+            OmsCommand::Submit(order) => {
+                let snapshot = self.snapshots.get(&order.instrument_id);
+                self.gateway.submit(signer, order, snapshot, clock).map(Some)
+            }
+            OmsCommand::Cancel(cancel) => self.gateway.cancel(signer, cancel, clock).map(Some),
+        }
+    }
+
+    pub fn drain<C: WallClock>(
+        &mut self,
+        signer: &impl RequestSigner,
+        clock: &C,
+    ) -> Vec<Result<ExecutionReport, ExecutionError>> {
+        let mut outcomes = Vec::new();
+        while self.pending_commands.front().is_some() {
+            match self.process_next(signer, clock) {
+                Ok(Some(report)) => outcomes.push(Ok(report)),
+                Ok(None) => break,
+                Err(error) => outcomes.push(Err(error)),
+            }
+        }
+        outcomes
+    }
+
+    #[must_use]
+    pub fn gateway(&self) -> &ExecutionGateway {
+        &self.gateway
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ReconciliationState {
     pub reports: BTreeMap<String, ExecutionReport>,
@@ -183,6 +275,7 @@ impl ReconciliationState {
     pub fn apply_private_event(&mut self, event: PrivateStreamEvent) -> Option<ExecutionReport> {
         match event {
             PrivateStreamEvent::Account(balance) => {
+                self.portfolio_risk.apply_account_balance(&balance);
                 self.balances.insert(balance.currency.clone(), balance);
                 None
             }
@@ -467,7 +560,7 @@ mod tests {
     use super::*;
     use chrono::{DateTime, TimeZone, Utc};
     use qae_core::{CancelOrderRequest, InstrumentId, OrderRequest, OrderSide, OrderType};
-    use qae_market_data::{MarketSnapshot, OrderBookLevel, OrderBookSnapshot, Ticker};
+    use qae_market_data::{MarketDataUpdate, MarketSnapshot, OrderBookLevel, OrderBookSnapshot, Ticker};
     use qae_okx_client::HmacSha256Signer;
     use qae_time::ExchangeTimestamp;
 
@@ -768,5 +861,77 @@ mod tests {
             Some(2)
         );
         assert_eq!(gateway.open_orders().len(), 1);
+    }
+
+    #[test]
+    fn oms_runtime_processes_queued_commands_in_order() {
+        let config = AppConfig::default();
+        let mut runtime = OmsRuntime::new(&config).expect("runtime");
+        let snapshot = sample_snapshot();
+
+        runtime.apply_market_update(MarketDataUpdate::Ticker(
+            snapshot.ticker.clone().expect("ticker"),
+        ));
+        runtime.apply_market_update(MarketDataUpdate::OrderBook(
+            snapshot.order_book.clone().expect("book"),
+        ));
+
+        let submit = OrderRequest::new(
+            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            1.0,
+        )
+        .and_then(|order| order.with_limit_price(99.0))
+        .expect("order")
+        .with_client_order_id("cid-oms");
+        runtime.enqueue(OmsCommand::Submit(submit));
+        runtime.enqueue(OmsCommand::Cancel(
+            CancelOrderRequest::new(InstrumentId::new("BTC-USDT-SWAP").expect("instrument"))
+                .with_client_order_id("cid-oms"),
+        ));
+
+        let first = runtime
+            .process_next(
+                &HmacSha256Signer,
+                &FixedClock(
+                    Utc.timestamp_millis_opt(1_700_000_000_000)
+                        .single()
+                        .expect("ts"),
+                ),
+            )
+            .expect("first result")
+            .expect("first report");
+        let second = runtime
+            .process_next(
+                &HmacSha256Signer,
+                &FixedClock(
+                    Utc.timestamp_millis_opt(1_700_000_000_001)
+                        .single()
+                        .expect("ts"),
+                ),
+            )
+            .expect("second result")
+            .expect("second report");
+
+        assert_eq!(first.status, OrderStatus::Accepted);
+        assert_eq!(second.status, OrderStatus::Cancelled);
+        assert_eq!(runtime.pending_command_count(), 0);
+    }
+
+    #[test]
+    fn reconciliation_tracks_account_balances_in_portfolio_risk_state() {
+        let mut reconciliation = ReconciliationState::default();
+        reconciliation.apply_private_event(PrivateStreamEvent::Account(AccountBalance {
+            currency: "USDT".to_string(),
+            equity: 1_000.0,
+            available_equity: 950.0,
+        }));
+
+        assert_eq!(reconciliation.portfolio_risk.last_known_equity, Some(1_000.0));
+        assert_eq!(
+            reconciliation.portfolio_risk.last_known_available_equity,
+            Some(950.0)
+        );
     }
 }

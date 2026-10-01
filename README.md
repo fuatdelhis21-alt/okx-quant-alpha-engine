@@ -16,8 +16,9 @@ The repository currently delivers a safe-by-default foundation plus the next sca
 - Risk guardrails for staged order requests
 - Paper/simulation execution scaffolding plus normalized live REST order submission and cancellation
 - Optional authenticated private WebSocket startup login, subscription, and private event parsing flow
+- Persistent in-memory portfolio risk accounting and OMS command queue scaffolding
 
-The repository still does not include a full OMS/strategy layer, but live order acknowledgements, cancellations, and private stream events now flow through shared execution-report types with in-memory reconciliation history.
+The repository still does not include a full strategy layer, but live order acknowledgements, cancellations, private stream events, portfolio risk state, and in-memory OMS command handling now flow through shared execution-report types.
 
 ## Workspace structure
 
@@ -27,8 +28,8 @@ The repository still does not include a full OMS/strategy layer, but live order 
 - `crates/time`: wall clock, exchange timestamp, monotonic elapsed timing, offset state scaffolding
 - `crates/monitoring`: tracing initialization and secret-safe helpers
 - `crates/okx-client`: OKX V5 request/signing foundation, websocket login, and live order submit/cancel transport
-- `crates/risk`: order guardrails plus portfolio-risk state scaffolding
-- `crates/execution`: paper/simulation order lifecycle flow, live execution gateway, and reconciliation state/history
+- `crates/risk`: order guardrails plus persistent portfolio-risk/accounting state
+- `crates/execution`: paper/simulation order lifecycle flow, live execution gateway, reconciliation state/history, and OMS command runtime
 - `crates/websocket-engine`: bounded-channel engine scaffolding, reconnect/backoff, heartbeat, subscriptions, parsing, private event ingestion, and snapshot cache
 - `apps/trader`: startup binary wiring config + monitoring + websocket/risk/execution scaffolding
 
