@@ -138,10 +138,7 @@ impl StartupSpreadStrategy {
                 .ok_or_else(|| StrategyError::MissingBook(ticker.instrument_id.to_string()))?
                 .price
         };
-        let client_order_id = format!(
-            "strategy-{:08}",
-            self.signals_emitted.saturating_add(1)
-        );
+        let client_order_id = format!("strategy-{:08}", self.signals_emitted.saturating_add(1));
         let order = OrderRequest::new(instrument_id, side, OrderType::Limit, self.order_quantity)?
             .with_limit_price(limit_price)?
             .with_client_order_id(client_order_id);
@@ -259,10 +256,7 @@ mod tests {
         match action {
             StrategyAction::Cancel(cancel) => {
                 assert_eq!(cancel.order_id.as_deref(), Some("paper-00000001"));
-                assert_eq!(
-                    cancel.client_order_id.as_deref(),
-                    Some("strategy-00000001")
-                );
+                assert_eq!(cancel.client_order_id.as_deref(), Some("strategy-00000001"));
             }
             StrategyAction::Submit(_) => panic!("expected cancel action"),
         }

@@ -910,6 +910,7 @@ dependencies = [
  "qae-risk",
  "qae-time",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -950,6 +951,17 @@ dependencies = [
 
 [[package]]
 name = "qae-risk"
+version = "0.1.0"
+dependencies = [
+ "qae-config",
+ "qae-core",
+ "qae-market-data",
+ "qae-time",
+ "thiserror",
+]
+
+[[package]]
+name = "qae-strategy"
 version = "0.1.0"
 dependencies = [
  "qae-config",
@@ -1730,6 +1742,7 @@ dependencies = [
  "qae-monitoring",
  "qae-okx-client",
  "qae-risk",
+ "qae-strategy",
  "qae-time",
  "qae-websocket-engine",
  "tokio",

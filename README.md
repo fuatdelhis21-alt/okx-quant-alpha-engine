@@ -16,9 +16,9 @@ The repository currently delivers a safe-by-default foundation plus the next sca
 - Risk guardrails for staged order requests
 - Paper/simulation execution scaffolding plus normalized live REST order submission and cancellation
 - Optional authenticated private WebSocket startup login, subscription, and private event parsing flow
-- Persistent in-memory portfolio risk accounting and OMS command queue scaffolding
+- Persistent in-memory portfolio risk accounting, async OMS service orchestration, and startup-gated strategy scaffolding
 
-The repository still does not include a full strategy layer, but live order acknowledgements, cancellations, private stream events, portfolio risk state, and in-memory OMS command handling now flow through shared execution-report types.
+The repository now includes a bounded startup strategy path that can turn cached snapshots into OMS submit/cancel commands, while live order acknowledgements, cancellations, private stream events, and portfolio risk state continue to flow through shared execution-report types.
 
 ## Workspace structure
 
@@ -29,9 +29,10 @@ The repository still does not include a full strategy layer, but live order ackn
 - `crates/monitoring`: tracing initialization and secret-safe helpers
 - `crates/okx-client`: OKX V5 request/signing foundation, websocket login, and live order submit/cancel transport
 - `crates/risk`: order guardrails plus persistent portfolio-risk/accounting state
-- `crates/execution`: paper/simulation order lifecycle flow, live execution gateway, reconciliation state/history, and OMS command runtime
+- `crates/execution`: paper/simulation order lifecycle flow, live execution gateway, reconciliation state/history, OMS command runtime, and async OMS service loop
+- `crates/strategy`: startup-safe strategy orchestration that converts cached snapshots and execution reports into bounded OMS actions
 - `crates/websocket-engine`: bounded-channel engine scaffolding, reconnect/backoff, heartbeat, subscriptions, parsing, private event ingestion, and snapshot cache
-- `apps/trader`: startup binary wiring config + monitoring + websocket/risk/execution scaffolding
+- `apps/trader`: startup binary wiring config + monitoring + websocket/risk/execution/strategy orchestration
 
 ## Safety model
 
@@ -86,6 +87,12 @@ Environment variables:
 - Paper execution
   - `PAPER_STARTING_BALANCE_USDT`
   - `PAPER_FILL_SLIPPAGE_BPS`
+- Startup strategy
+  - `ENABLE_STARTUP_STRATEGY`
+  - `STRATEGY_ORDER_QUANTITY`
+  - `STRATEGY_ENTRY_SPREAD_BPS`
+  - `STRATEGY_CANCEL_SPREAD_BPS`
+  - `STRATEGY_MAX_SIGNALS_PER_RUN`
 
 Defaults are documented in `crates/config/src/lib.rs`.
 
@@ -113,3 +120,8 @@ For authenticated private WebSocket login plus account/orders/positions/fills st
 
 - `CONNECT_PRIVATE_STREAM_ON_STARTUP=true`
 - set `OKX_API_KEY`, `OKX_API_SECRET`, and `OKX_API_PASSPHRASE`
+
+To exercise the bounded startup strategy loop on cached public snapshots, also enable:
+
+- `ENABLE_STARTUP_STRATEGY=true`
+- optionally tune `STRATEGY_ORDER_QUANTITY`, `STRATEGY_ENTRY_SPREAD_BPS`, `STRATEGY_CANCEL_SPREAD_BPS`, and `STRATEGY_MAX_SIGNALS_PER_RUN`

@@ -187,8 +187,7 @@ impl AppConfig {
         }
 
         if let Some(value) = map.get("ENABLE_STARTUP_STRATEGY") {
-            self.strategy.enable_startup_strategy =
-                parse_bool("ENABLE_STARTUP_STRATEGY", value)?;
+            self.strategy.enable_startup_strategy = parse_bool("ENABLE_STARTUP_STRATEGY", value)?;
         }
 
         if let Some(value) = map.get("STRATEGY_ORDER_QUANTITY") {
@@ -315,7 +314,10 @@ impl AppConfig {
         for (name, value) in [
             ("STRATEGY_ORDER_QUANTITY", self.strategy.order_quantity),
             ("STRATEGY_ENTRY_SPREAD_BPS", self.strategy.entry_spread_bps),
-            ("STRATEGY_CANCEL_SPREAD_BPS", self.strategy.cancel_spread_bps),
+            (
+                "STRATEGY_CANCEL_SPREAD_BPS",
+                self.strategy.cancel_spread_bps,
+            ),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(ConfigError::InvalidValue {
@@ -635,25 +637,25 @@ impl Default for ExecutionConfig {
             paper_fill_slippage_bps: 2.0,
         }
     }
+}
 
-    #[derive(Debug, Clone)]
-    pub struct StrategyConfig {
-        pub enable_startup_strategy: bool,
-        pub order_quantity: f64,
-        pub entry_spread_bps: f64,
-        pub cancel_spread_bps: f64,
-        pub max_signals_per_run: u32,
-    }
+#[derive(Debug, Clone)]
+pub struct StrategyConfig {
+    pub enable_startup_strategy: bool,
+    pub order_quantity: f64,
+    pub entry_spread_bps: f64,
+    pub cancel_spread_bps: f64,
+    pub max_signals_per_run: u32,
+}
 
-    impl Default for StrategyConfig {
-        fn default() -> Self {
-            Self {
-                enable_startup_strategy: false,
-                order_quantity: 1.0,
-                entry_spread_bps: 75.0,
-                cancel_spread_bps: 150.0,
-                max_signals_per_run: 2,
-            }
+impl Default for StrategyConfig {
+    fn default() -> Self {
+        Self {
+            enable_startup_strategy: false,
+            order_quantity: 1.0,
+            entry_spread_bps: 75.0,
+            cancel_spread_bps: 150.0,
+            max_signals_per_run: 2,
         }
     }
 }
