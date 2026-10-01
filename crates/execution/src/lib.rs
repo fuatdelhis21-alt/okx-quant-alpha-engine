@@ -92,7 +92,9 @@ impl ExecutionGateway {
             .ok_or_else(|| ExecutionError::OrderNotFound(cancel.instrument_id.to_string()))?;
 
         if !status_is_open(existing_report.status) {
-            return Err(ExecutionError::OrderNotCancellable(existing_report.order_id));
+            return Err(ExecutionError::OrderNotCancellable(
+                existing_report.order_id,
+            ));
         }
 
         let report = match self.mode {
@@ -255,7 +257,9 @@ impl ReconciliationState {
             })
             .or_else(|| {
                 cancel.client_order_id.as_ref().and_then(|client_order_id| {
-                    self.reports_by_client_order_id.get(client_order_id).cloned()
+                    self.reports_by_client_order_id
+                        .get(client_order_id)
+                        .cloned()
                 })
             })
     }
@@ -639,10 +643,8 @@ mod tests {
         let cancelled = gateway
             .cancel(
                 &HmacSha256Signer,
-                CancelOrderRequest::new(
-                    InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
-                )
-                .with_client_order_id("cid-cancel"),
+                CancelOrderRequest::new(InstrumentId::new("BTC-USDT-SWAP").expect("instrument"))
+                    .with_client_order_id("cid-cancel"),
                 &FixedClock(
                     Utc.timestamp_millis_opt(1_700_000_000_001)
                         .single()

@@ -706,10 +706,9 @@ mod tests {
             passphrase: Some("p".into()),
         };
 
-        let cancel = CancelOrderRequest::new(
-            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
-        )
-        .with_client_order_id("cid-1");
+        let cancel =
+            CancelOrderRequest::new(InstrumentId::new("BTC-USDT-SWAP").expect("instrument"))
+                .with_client_order_id("cid-1");
 
         let signed = OkxClient::new(cfg)
             .build_signed_cancel_order_request(
@@ -785,11 +784,10 @@ mod tests {
             passphrase: Some("p".into()),
         };
 
-        let cancel = CancelOrderRequest::new(
-            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
-        )
-        .with_order_id("42")
-        .with_client_order_id("cid-7");
+        let cancel =
+            CancelOrderRequest::new(InstrumentId::new("BTC-USDT-SWAP").expect("instrument"))
+                .with_order_id("42")
+                .with_client_order_id("cid-7");
         let existing = ExecutionReport {
             order_id: "42".to_string(),
             client_order_id: Some("cid-7".to_string()),
