@@ -4,7 +4,7 @@ use qae_execution::{OmsCommand, OmsService, OmsServiceHandle, OmsServiceOutcome}
 use qae_monitoring::{MonitoringConfig, init_tracing};
 use qae_okx_client::{HmacSha256Signer, OkxClient};
 use qae_risk::RiskManager;
-use qae_strategy::{StartupSpreadStrategy, StrategyAction};
+use qae_strategy::{StrategyAction, StrategyRuntime};
 use qae_time::SystemWallClock;
 use qae_websocket_engine::WebsocketEngine;
 use std::time::Duration;
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     let mut oms_service =
         OmsService::spawn(config.clone()).context("execution service configuration invalid")?;
     let oms_handle = oms_service.handle.clone();
-    let mut strategy = StartupSpreadStrategy::new(&config);
+    let mut strategy = StrategyRuntime::new(&config);
     let mut processed_outcomes = 0usize;
 
     info!(
@@ -55,26 +55,20 @@ async fn main() -> Result<()> {
             .context("failed to collect public websocket updates")?;
 
         for update in updates.iter().cloned() {
-            let instrument_id = match &update {
-                qae_market_data::MarketDataUpdate::Ticker(ticker) => ticker.instrument_id.clone(),
-                qae_market_data::MarketDataUpdate::OrderBook(order_book) => {
-                    order_book.instrument_id.clone()
-                }
-            };
             oms_handle
-                .publish_market_update(update)
+                .publish_market_update(update.clone())
                 .await
                 .context("failed to publish public market update to oms service")?;
 
-            if strategy.is_enabled()
-                && let Some(snapshot) = websocket_engine.latest_snapshot(&instrument_id)
-                && let Some(action) = strategy
-                    .evaluate_snapshot(snapshot)
-                    .context("failed to evaluate startup strategy snapshot")?
-            {
-                dispatch_strategy_action(&oms_handle, action)
-                    .await
-                    .context("failed to submit strategy action to oms service")?;
+            if strategy.is_enabled() {
+                let actions = strategy
+                    .on_market_update(update)
+                    .context("failed to evaluate strategy runtime market update")?;
+                for action in actions {
+                    dispatch_strategy_action(&oms_handle, action)
+                        .await
+                        .context("failed to submit strategy action to oms service")?;
+                }
             }
 
             processed_outcomes += drain_oms_outcomes(&mut oms_service.outcomes, &mut strategy);
@@ -159,7 +153,7 @@ async fn dispatch_strategy_action(handle: &OmsServiceHandle, action: StrategyAct
 
 fn drain_oms_outcomes(
     outcomes: &mut mpsc::Receiver<OmsServiceOutcome>,
-    strategy: &mut StartupSpreadStrategy,
+    strategy: &mut StrategyRuntime,
 ) -> usize {
     let mut drained = 0;
 

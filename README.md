@@ -16,7 +16,7 @@ The repository currently delivers a safe-by-default foundation plus the next sca
 - Risk guardrails for staged order requests
 - Paper/simulation execution scaffolding plus normalized live REST order submission and cancellation
 - Optional authenticated private WebSocket startup login, subscription, and private event parsing flow
-- Persistent in-memory portfolio risk accounting, async OMS service orchestration, and startup-gated strategy scaffolding
+- Persistent in-memory portfolio risk accounting, async OMS service orchestration, and a strategy runtime that owns its own snapshot-driven startup decisions
 
 The repository now includes a bounded startup strategy path that can turn cached snapshots into OMS submit/cancel commands, while live order acknowledgements, cancellations, private stream events, and portfolio risk state continue to flow through shared execution-report types.
 
@@ -30,7 +30,7 @@ The repository now includes a bounded startup strategy path that can turn cached
 - `crates/okx-client`: OKX V5 request/signing foundation, websocket login, and live order submit/cancel transport
 - `crates/risk`: order guardrails plus persistent portfolio-risk/accounting state
 - `crates/execution`: paper/simulation order lifecycle flow, live execution gateway, reconciliation state/history, OMS command runtime, and async OMS service loop
-- `crates/strategy`: startup-safe strategy orchestration that converts cached snapshots and execution reports into bounded OMS actions
+- `crates/strategy`: startup-safe strategy orchestration runtime that maintains strategy snapshot state and converts market updates plus execution reports into bounded OMS actions
 - `crates/websocket-engine`: bounded-channel engine scaffolding, reconnect/backoff, heartbeat, subscriptions, parsing, private event ingestion, and snapshot cache
 - `apps/trader`: startup binary wiring config + monitoring + websocket/risk/execution/strategy orchestration
 

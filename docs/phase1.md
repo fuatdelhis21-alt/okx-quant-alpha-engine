@@ -12,7 +12,7 @@
 8. Risk guardrails for staged order requests using configured quantity, notional, and price-band limits plus persistent in-memory portfolio accounting from balances, positions, and fills.
 9. Execution bridging that uses paper fills in paper/simulation modes and submits normalized live REST order requests and cancellations in live mode, with an in-memory OMS command queue and async OMS service loop.
 10. Trader app bootstrap that validates config and starts in non-live mode by default.
-11. Startup-gated strategy orchestration that turns cached market snapshots into bounded OMS submit/cancel actions.
+11. Startup-gated strategy orchestration runtime that maintains its own cached market snapshots and turns market updates into bounded OMS submit/cancel actions.
 
 ## What still explicitly is NOT included
 
@@ -28,4 +28,4 @@
 - `qae-config` keeps credentials env-only to avoid accidental secret persistence.
 - `qae-okx-client` separates signing and request assembly from operation-specific APIs, including WebSocket login and REST order submission payloads.
 - `qae-websocket-engine` centralizes connection lifecycle, startup authentication, private/public stream ingestion, parsing, and market snapshot state for future stream handlers.
-- `qae-risk`, `qae-execution`, and `qae-strategy` keep simulated order flow separate while still allowing live-mode tasks to submit authenticated orders, cancel them, maintain persistent in-memory portfolio accounting, process queued OMS commands against shared market snapshots, and attach bounded strategy decisions behind explicit startup config gates.
+- `qae-risk`, `qae-execution`, and `qae-strategy` keep simulated order flow separate while still allowing live-mode tasks to submit authenticated orders, cancel them, maintain persistent in-memory portfolio accounting, process queued OMS commands against shared market snapshots, and attach bounded strategy-runtime decisions behind explicit startup config gates.

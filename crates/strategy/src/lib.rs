@@ -3,7 +3,7 @@ use qae_core::{
     CancelOrderRequest, ExecutionReport, InstrumentId, OrderRequest, OrderSide, OrderStatus,
     OrderType,
 };
-use qae_market_data::MarketSnapshot;
+use qae_market_data::{MarketDataUpdate, MarketSnapshot};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -11,6 +11,12 @@ use thiserror::Error;
 pub enum StrategyAction {
     Submit(OrderRequest),
     Cancel(CancelOrderRequest),
+}
+
+#[derive(Debug, Clone)]
+pub struct StrategyRuntime {
+    strategy: StartupSpreadStrategy,
+    snapshots: BTreeMap<InstrumentId, MarketSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +155,63 @@ impl StartupSpreadStrategy {
     }
 }
 
+impl StrategyRuntime {
+    pub fn new(config: &AppConfig) -> Self {
+        Self {
+            strategy: StartupSpreadStrategy::new(config),
+            snapshots: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.strategy.is_enabled()
+    }
+
+    pub fn on_market_update(
+        &mut self,
+        update: MarketDataUpdate,
+    ) -> Result<Vec<StrategyAction>, StrategyError> {
+        let instrument_id = match update {
+            MarketDataUpdate::Ticker(ticker) => {
+                let instrument_id = ticker.instrument_id.clone();
+                self.snapshots
+                    .entry(instrument_id.clone())
+                    .or_default()
+                    .ticker = Some(ticker);
+                instrument_id
+            }
+            MarketDataUpdate::OrderBook(order_book) => {
+                let instrument_id = order_book.instrument_id.clone();
+                self.snapshots
+                    .entry(instrument_id.clone())
+                    .or_default()
+                    .order_book = Some(order_book);
+                instrument_id
+            }
+        };
+
+        let Some(snapshot) = self.snapshots.get(&instrument_id) else {
+            return Ok(Vec::new());
+        };
+
+        match self.strategy.evaluate_snapshot(snapshot) {
+            Ok(action) => Ok(action.into_iter().collect()),
+            Err(StrategyError::MissingTicker(_) | StrategyError::MissingBook(_)) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn on_execution_report(&mut self, report: &ExecutionReport) {
+        self.strategy.on_execution_report(report);
+    }
+
+    #[must_use]
+    pub fn latest_snapshot(&self, instrument_id: &InstrumentId) -> Option<&MarketSnapshot> {
+        self.snapshots.get(instrument_id)
+    }
+}
+
 fn status_is_open(status: OrderStatus) -> bool {
     matches!(
         status,
@@ -275,5 +338,28 @@ mod tests {
 
         assert!(matches!(first, Some(StrategyAction::Submit(_))));
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn runtime_waits_for_complete_snapshot_before_emitting_action() {
+        let mut runtime = StrategyRuntime::new(&sample_config());
+        let snapshot = sample_snapshot(99.5, 99.0, 99.4);
+
+        let ticker_actions = runtime
+            .on_market_update(MarketDataUpdate::Ticker(
+                snapshot.ticker.clone().expect("ticker"),
+            ))
+            .expect("ticker decision");
+        let book_actions = runtime
+            .on_market_update(MarketDataUpdate::OrderBook(
+                snapshot.order_book.clone().expect("book"),
+            ))
+            .expect("book decision");
+
+        assert!(ticker_actions.is_empty());
+        assert!(matches!(
+            book_actions.as_slice(),
+            [StrategyAction::Submit(_)]
+        ));
     }
 }
