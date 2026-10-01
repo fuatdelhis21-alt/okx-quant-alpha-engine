@@ -4,11 +4,15 @@ use qae_core::{
     OrderStatus, PositionUpdate, PrivateStreamEvent, RuntimeMode,
 };
 use qae_market_data::{MarketDataUpdate, MarketSnapshot};
-use qae_okx_client::{OkxClient, OkxClientError, RequestSigner, ReqwestLiveOrderTransport};
+use qae_okx_client::{
+    HmacSha256Signer, OkxClient, OkxClientError, RequestSigner, ReqwestLiveOrderTransport,
+};
 use qae_risk::{PortfolioRiskManager, PortfolioRiskState, RiskManager, RiskViolation};
-use qae_time::WallClock;
+use qae_time::{SystemWallClock, WallClock};
 use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 pub struct PaperExecutionEngine {
@@ -40,6 +44,106 @@ pub struct OmsRuntime {
     gateway: ExecutionGateway,
     snapshots: BTreeMap<InstrumentId, MarketSnapshot>,
     pending_commands: VecDeque<OmsCommand>,
+}
+
+pub type OmsServiceOutcome = Result<ExecutionReport, ExecutionError>;
+
+#[derive(Debug, Clone)]
+enum OmsServiceMessage {
+    Command(OmsCommand),
+    MarketData(MarketDataUpdate),
+    PrivateEvent(PrivateStreamEvent),
+    Shutdown,
+}
+
+#[derive(Debug, Clone)]
+pub struct OmsServiceHandle {
+    message_tx: mpsc::Sender<OmsServiceMessage>,
+}
+
+#[derive(Debug)]
+pub struct OmsService {
+    pub handle: OmsServiceHandle,
+    pub outcomes: mpsc::Receiver<OmsServiceOutcome>,
+    pub task: JoinHandle<Result<(), ExecutionError>>,
+}
+
+impl OmsService {
+    pub fn spawn(config: AppConfig) -> Result<Self, ExecutionError> {
+        let mut runtime = OmsRuntime::new(&config)?;
+        let (message_tx, mut message_rx) = mpsc::channel(256);
+        let (outcome_tx, outcome_rx) = mpsc::channel(256);
+        let task = tokio::spawn(async move {
+            let signer = HmacSha256Signer;
+            let clock = SystemWallClock;
+
+            while let Some(message) = message_rx.recv().await {
+                match message {
+                    OmsServiceMessage::Command(command) => {
+                        runtime.enqueue(command);
+                        for outcome in runtime.drain(&signer, &clock) {
+                            if outcome_tx.send(outcome).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    OmsServiceMessage::MarketData(update) => runtime.apply_market_update(update),
+                    OmsServiceMessage::PrivateEvent(event) => {
+                        if let Some(report) = runtime.apply_private_event(event)
+                            && outcome_tx.send(Ok(report)).await.is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                    OmsServiceMessage::Shutdown => break,
+                }
+            }
+
+            Ok(())
+        });
+
+        Ok(Self {
+            handle: OmsServiceHandle { message_tx },
+            outcomes: outcome_rx,
+            task,
+        })
+    }
+}
+
+impl OmsServiceHandle {
+    pub async fn submit_command(&self, command: OmsCommand) -> Result<(), OmsServiceSendError> {
+        self.message_tx
+            .send(OmsServiceMessage::Command(command))
+            .await
+            .map_err(|_| OmsServiceSendError::Closed)
+    }
+
+    pub async fn publish_market_update(
+        &self,
+        update: MarketDataUpdate,
+    ) -> Result<(), OmsServiceSendError> {
+        self.message_tx
+            .send(OmsServiceMessage::MarketData(update))
+            .await
+            .map_err(|_| OmsServiceSendError::Closed)
+    }
+
+    pub async fn publish_private_event(
+        &self,
+        event: PrivateStreamEvent,
+    ) -> Result<(), OmsServiceSendError> {
+        self.message_tx
+            .send(OmsServiceMessage::PrivateEvent(event))
+            .await
+            .map_err(|_| OmsServiceSendError::Closed)
+    }
+
+    pub async fn shutdown(&self) -> Result<(), OmsServiceSendError> {
+        self.message_tx
+            .send(OmsServiceMessage::Shutdown)
+            .await
+            .map_err(|_| OmsServiceSendError::Closed)
+    }
 }
 
 impl ExecutionGateway {
@@ -553,6 +657,12 @@ pub enum ExecutionError {
     OrderNotCancellable(String),
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum OmsServiceSendError {
+    #[error("oms service is not running")]
+    Closed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +725,59 @@ mod tests {
 
         assert_eq!(report.status, OrderStatus::Filled);
         assert_eq!(report.average_fill_price, Some(100.5201));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oms_service_processes_market_data_and_commands() {
+        let service = OmsService::spawn(AppConfig::default()).expect("service");
+        let handle = service.handle.clone();
+        let mut outcomes = service.outcomes;
+        let task = service.task;
+        let instrument_id = InstrumentId::new("BTC-USDT-SWAP").expect("instrument");
+
+        handle
+            .publish_market_update(MarketDataUpdate::Ticker(
+                Ticker::new(
+                    instrument_id.clone(),
+                    100.0,
+                    99.5,
+                    100.5,
+                    ExchangeTimestamp::from_millis(1_700_000_000_000),
+                )
+                .expect("ticker"),
+            ))
+            .await
+            .expect("ticker sent");
+        handle
+            .publish_market_update(MarketDataUpdate::OrderBook(
+                OrderBookSnapshot::new(
+                    instrument_id.clone(),
+                    vec![OrderBookLevel::new(99.5, 1.0).expect("bid")],
+                    vec![OrderBookLevel::new(100.5, 1.0).expect("ask")],
+                    None,
+                    ExchangeTimestamp::from_millis(1_700_000_000_000),
+                )
+                .expect("book"),
+            ))
+            .await
+            .expect("book sent");
+        handle
+            .submit_command(OmsCommand::Submit(
+                OrderRequest::new(instrument_id, OrderSide::Buy, OrderType::Market, 1.0)
+                    .expect("order"),
+            ))
+            .await
+            .expect("command sent");
+
+        let report = outcomes
+            .recv()
+            .await
+            .expect("outcome")
+            .expect("execution report");
+        assert_eq!(report.status, OrderStatus::Filled);
+
+        handle.shutdown().await.expect("shutdown sent");
+        task.await.expect("task join").expect("task result");
     }
 
     #[test]

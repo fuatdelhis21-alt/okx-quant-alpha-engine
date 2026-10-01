@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub market_data: MarketDataConfig,
     pub risk: RiskConfig,
     pub execution: ExecutionConfig,
+    pub strategy: StrategyConfig,
 }
 
 impl Default for AppConfig {
@@ -34,6 +35,7 @@ impl Default for AppConfig {
             market_data: MarketDataConfig::default(),
             risk: RiskConfig::default(),
             execution: ExecutionConfig::default(),
+            strategy: StrategyConfig::default(),
         }
     }
 }
@@ -184,6 +186,27 @@ impl AppConfig {
             self.execution.paper_fill_slippage_bps = parse_f64("PAPER_FILL_SLIPPAGE_BPS", value)?;
         }
 
+        if let Some(value) = map.get("ENABLE_STARTUP_STRATEGY") {
+            self.strategy.enable_startup_strategy =
+                parse_bool("ENABLE_STARTUP_STRATEGY", value)?;
+        }
+
+        if let Some(value) = map.get("STRATEGY_ORDER_QUANTITY") {
+            self.strategy.order_quantity = parse_f64("STRATEGY_ORDER_QUANTITY", value)?;
+        }
+
+        if let Some(value) = map.get("STRATEGY_ENTRY_SPREAD_BPS") {
+            self.strategy.entry_spread_bps = parse_f64("STRATEGY_ENTRY_SPREAD_BPS", value)?;
+        }
+
+        if let Some(value) = map.get("STRATEGY_CANCEL_SPREAD_BPS") {
+            self.strategy.cancel_spread_bps = parse_f64("STRATEGY_CANCEL_SPREAD_BPS", value)?;
+        }
+
+        if let Some(value) = map.get("STRATEGY_MAX_SIGNALS_PER_RUN") {
+            self.strategy.max_signals_per_run = parse_u32("STRATEGY_MAX_SIGNALS_PER_RUN", value)?;
+        }
+
         self.okx.credentials = ApiCredentials {
             api_key: map
                 .get("OKX_API_KEY")
@@ -286,6 +309,33 @@ impl AppConfig {
             return Err(ConfigError::InvalidValue {
                 name: "RISK_MAX_OPEN_ORDERS",
                 value: self.risk.max_open_orders.to_string(),
+            });
+        }
+
+        for (name, value) in [
+            ("STRATEGY_ORDER_QUANTITY", self.strategy.order_quantity),
+            ("STRATEGY_ENTRY_SPREAD_BPS", self.strategy.entry_spread_bps),
+            ("STRATEGY_CANCEL_SPREAD_BPS", self.strategy.cancel_spread_bps),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    name,
+                    value: value.to_string(),
+                });
+            }
+        }
+
+        if self.strategy.cancel_spread_bps < self.strategy.entry_spread_bps {
+            return Err(ConfigError::InvalidValue {
+                name: "STRATEGY_CANCEL_SPREAD_BPS",
+                value: self.strategy.cancel_spread_bps.to_string(),
+            });
+        }
+
+        if self.strategy.max_signals_per_run == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "STRATEGY_MAX_SIGNALS_PER_RUN",
+                value: self.strategy.max_signals_per_run.to_string(),
             });
         }
 
@@ -407,6 +457,24 @@ impl AppConfig {
             }
             if let Some(paper_fill_slippage_bps) = execution.paper_fill_slippage_bps {
                 self.execution.paper_fill_slippage_bps = paper_fill_slippage_bps;
+            }
+        }
+
+        if let Some(strategy) = file_cfg.strategy {
+            if let Some(enable_startup_strategy) = strategy.enable_startup_strategy {
+                self.strategy.enable_startup_strategy = enable_startup_strategy;
+            }
+            if let Some(order_quantity) = strategy.order_quantity {
+                self.strategy.order_quantity = order_quantity;
+            }
+            if let Some(entry_spread_bps) = strategy.entry_spread_bps {
+                self.strategy.entry_spread_bps = entry_spread_bps;
+            }
+            if let Some(cancel_spread_bps) = strategy.cancel_spread_bps {
+                self.strategy.cancel_spread_bps = cancel_spread_bps;
+            }
+            if let Some(max_signals_per_run) = strategy.max_signals_per_run {
+                self.strategy.max_signals_per_run = max_signals_per_run;
             }
         }
 
@@ -567,6 +635,27 @@ impl Default for ExecutionConfig {
             paper_fill_slippage_bps: 2.0,
         }
     }
+
+    #[derive(Debug, Clone)]
+    pub struct StrategyConfig {
+        pub enable_startup_strategy: bool,
+        pub order_quantity: f64,
+        pub entry_spread_bps: f64,
+        pub cancel_spread_bps: f64,
+        pub max_signals_per_run: u32,
+    }
+
+    impl Default for StrategyConfig {
+        fn default() -> Self {
+            Self {
+                enable_startup_strategy: false,
+                order_quantity: 1.0,
+                entry_spread_bps: 75.0,
+                cancel_spread_bps: 150.0,
+                max_signals_per_run: 2,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -669,6 +758,7 @@ struct TomlAppConfig {
     market_data: Option<TomlMarketDataConfig>,
     risk: Option<TomlRiskConfig>,
     execution: Option<TomlExecutionConfig>,
+    strategy: Option<TomlStrategyConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -721,6 +811,15 @@ struct TomlExecutionConfig {
     paper_fill_slippage_bps: Option<f64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TomlStrategyConfig {
+    enable_startup_strategy: Option<bool>,
+    order_quantity: Option<f64>,
+    entry_spread_bps: Option<f64>,
+    cancel_spread_bps: Option<f64>,
+    max_signals_per_run: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,6 +838,7 @@ mod tests {
         assert!(!cfg.market_data.connect_public_stream_on_startup);
         assert!(!cfg.market_data.connect_private_stream_on_startup);
         assert_eq!(cfg.risk.max_open_orders, 20);
+        assert!(!cfg.strategy.enable_startup_strategy);
     }
 
     #[test]
@@ -780,6 +880,45 @@ mod tests {
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::MissingLiveCredentials)
+        ));
+    }
+
+    #[test]
+    fn env_overrides_strategy_settings() {
+        let mut cfg = AppConfig::default();
+        cfg.apply_env_overrides(vec![
+            ("ENABLE_STARTUP_STRATEGY", "true"),
+            ("STRATEGY_ORDER_QUANTITY", "2.5"),
+            ("STRATEGY_ENTRY_SPREAD_BPS", "40"),
+            ("STRATEGY_CANCEL_SPREAD_BPS", "90"),
+            ("STRATEGY_MAX_SIGNALS_PER_RUN", "3"),
+        ])
+        .expect("env should parse");
+
+        assert!(cfg.strategy.enable_startup_strategy);
+        assert_eq!(cfg.strategy.order_quantity, 2.5);
+        assert_eq!(cfg.strategy.entry_spread_bps, 40.0);
+        assert_eq!(cfg.strategy.cancel_spread_bps, 90.0);
+        assert_eq!(cfg.strategy.max_signals_per_run, 3);
+    }
+
+    #[test]
+    fn strategy_validation_rejects_cancel_threshold_below_entry() {
+        let cfg = AppConfig {
+            strategy: StrategyConfig {
+                entry_spread_bps: 90.0,
+                cancel_spread_bps: 80.0,
+                ..StrategyConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValue {
+                name: "STRATEGY_CANCEL_SPREAD_BPS",
+                ..
+            })
         ));
     }
 

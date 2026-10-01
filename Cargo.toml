@@ -8,6 +8,7 @@ members = [
   "crates/okx-client",
   "crates/risk",
   "crates/execution",
+  "crates/strategy",
   "crates/websocket-engine",
   "apps/trader",
 ]

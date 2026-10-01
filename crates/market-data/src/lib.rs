@@ -137,6 +137,14 @@ pub struct MarketSnapshot {
 
 impl MarketSnapshot {
     #[must_use]
+    pub fn instrument_id(&self) -> Option<&InstrumentId> {
+        self.order_book
+            .as_ref()
+            .map(|book| &book.instrument_id)
+            .or_else(|| self.ticker.as_ref().map(|ticker| &ticker.instrument_id))
+    }
+
+    #[must_use]
     pub fn reference_price_for(&self, side: OrderSide) -> Option<f64> {
         self.order_book
             .as_ref()
@@ -152,6 +160,27 @@ impl MarketSnapshot {
                     .as_ref()
                     .map(|ticker| ticker.reference_price_for(side))
             })
+    }
+
+    #[must_use]
+    pub fn mid_price(&self) -> Option<f64> {
+        self.order_book.as_ref().and_then(|book| {
+            let best_bid = book.best_bid()?.price;
+            let best_ask = book.best_ask()?.price;
+            Some((best_bid + best_ask) / 2.0)
+        })
+    }
+
+    #[must_use]
+    pub fn spread_bps(&self) -> Option<f64> {
+        let book = self.order_book.as_ref()?;
+        let best_bid = book.best_bid()?.price;
+        let best_ask = book.best_ask()?.price;
+        let mid_price = self.mid_price()?;
+        if mid_price <= 0.0 {
+            return None;
+        }
+        Some(((best_ask - best_bid) / mid_price) * 10_000.0)
     }
 }
 
@@ -221,5 +250,29 @@ mod tests {
 
         assert_eq!(ticker.reference_price_for(OrderSide::Buy), 100.5);
         assert_eq!(ticker.reference_price_for(OrderSide::Sell), 99.5);
+    }
+
+    #[test]
+    fn snapshot_reports_mid_price_and_spread() {
+        let snapshot = MarketSnapshot {
+            ticker: None,
+            order_book: Some(
+                OrderBookSnapshot::new(
+                    InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+                    vec![OrderBookLevel::new(99.0, 1.0).expect("bid")],
+                    vec![OrderBookLevel::new(101.0, 1.0).expect("ask")],
+                    None,
+                    ExchangeTimestamp::from_millis(1_700_000_000_000),
+                )
+                .expect("book"),
+            ),
+        };
+
+        assert_eq!(
+            snapshot.instrument_id().map(InstrumentId::as_str),
+            Some("BTC-USDT-SWAP")
+        );
+        assert_eq!(snapshot.mid_price(), Some(100.0));
+        assert_eq!(snapshot.spread_bps(), Some(200.0));
     }
 }

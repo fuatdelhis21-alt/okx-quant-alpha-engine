@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use qae_config::AppConfig;
-use qae_execution::OmsRuntime;
+use qae_execution::{OmsCommand, OmsService, OmsServiceHandle, OmsServiceOutcome};
 use qae_monitoring::{MonitoringConfig, init_tracing};
 use qae_okx_client::{HmacSha256Signer, OkxClient};
 use qae_risk::RiskManager;
+use qae_strategy::{StartupSpreadStrategy, StrategyAction};
 use qae_time::SystemWallClock;
 use qae_websocket_engine::WebsocketEngine;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 #[tokio::main(flavor = "current_thread")]
@@ -23,8 +25,11 @@ async fn main() -> Result<()> {
     let mut websocket_engine =
         WebsocketEngine::new(&config).context("websocket engine configuration invalid")?;
     let risk_manager = RiskManager::new(&config).context("risk manager configuration invalid")?;
-    let mut oms_runtime =
-        OmsRuntime::new(&config).context("execution gateway configuration invalid")?;
+    let mut oms_service =
+        OmsService::spawn(config.clone()).context("execution service configuration invalid")?;
+    let oms_handle = oms_service.handle.clone();
+    let mut strategy = StartupSpreadStrategy::new(&config);
+    let mut processed_outcomes = 0usize;
 
     info!(
         state = ?websocket_engine.state,
@@ -34,6 +39,10 @@ async fn main() -> Result<()> {
         "market data infrastructure initialized"
     );
     info!(?risk_manager, "risk and execution scaffolding initialized");
+    info!(
+        strategy_enabled = strategy.is_enabled(),
+        "oms service initialized"
+    );
 
     if config.market_data.connect_public_stream_on_startup {
         let updates = websocket_engine
@@ -46,11 +55,34 @@ async fn main() -> Result<()> {
             .context("failed to collect public websocket updates")?;
 
         for update in updates.iter().cloned() {
-            oms_runtime.apply_market_update(update);
+            let instrument_id = match &update {
+                qae_market_data::MarketDataUpdate::Ticker(ticker) => ticker.instrument_id.clone(),
+                qae_market_data::MarketDataUpdate::OrderBook(order_book) => {
+                    order_book.instrument_id.clone()
+                }
+            };
+            oms_handle
+                .publish_market_update(update)
+                .await
+                .context("failed to publish public market update to oms service")?;
+
+            if strategy.is_enabled()
+                && let Some(snapshot) = websocket_engine.latest_snapshot(&instrument_id)
+                && let Some(action) = strategy
+                    .evaluate_snapshot(snapshot)
+                    .context("failed to evaluate startup strategy snapshot")?
+            {
+                dispatch_strategy_action(&oms_handle, action)
+                    .await
+                    .context("failed to submit strategy action to oms service")?;
+            }
+
+            processed_outcomes += drain_oms_outcomes(&mut oms_service.outcomes, &mut strategy);
         }
 
         info!(
             received_updates = updates.len(),
+            processed_outcomes,
             cached_snapshots = updates
                 .iter()
                 .map(|update| match update {
@@ -85,9 +117,11 @@ async fn main() -> Result<()> {
             .context("failed to authenticate private websocket stream")?;
 
         for event in events {
-            if let Some(report) = oms_runtime.apply_private_event(event) {
-                info!(order_id = %report.order_id, status = ?report.status, "reconciled private order event");
-            }
+            oms_handle
+                .publish_private_event(event)
+                .await
+                .context("failed to publish private stream event to oms service")?;
+            processed_outcomes += drain_oms_outcomes(&mut oms_service.outcomes, &mut strategy);
         }
 
         info!("private websocket startup authentication and subscription handling completed");
@@ -95,11 +129,60 @@ async fn main() -> Result<()> {
         info!("private websocket startup session disabled by configuration");
     }
 
-    info!(
-        pending_commands = oms_runtime.pending_command_count(),
-        open_orders = oms_runtime.gateway().open_orders().len(),
-        "oms runtime initialized"
-    );
+    processed_outcomes += drain_oms_outcomes(&mut oms_service.outcomes, &mut strategy);
+    oms_handle
+        .shutdown()
+        .await
+        .context("failed to stop oms service")?;
+    oms_service
+        .task
+        .await
+        .context("failed to join oms service task")?
+        .context("oms service exited with error")?;
+
+    info!(processed_outcomes, "oms service shutdown completed");
 
     Ok(())
+}
+
+async fn dispatch_strategy_action(handle: &OmsServiceHandle, action: StrategyAction) -> Result<()> {
+    let command = match action {
+        StrategyAction::Submit(order) => OmsCommand::Submit(order),
+        StrategyAction::Cancel(cancel) => OmsCommand::Cancel(cancel),
+    };
+
+    handle
+        .submit_command(command)
+        .await
+        .context("oms service command channel closed")
+}
+
+fn drain_oms_outcomes(
+    outcomes: &mut mpsc::Receiver<OmsServiceOutcome>,
+    strategy: &mut StartupSpreadStrategy,
+) -> usize {
+    let mut drained = 0;
+
+    loop {
+        match outcomes.try_recv() {
+            Ok(Ok(report)) => {
+                strategy.on_execution_report(&report);
+                info!(
+                    order_id = %report.order_id,
+                    status = ?report.status,
+                    "processed oms execution report"
+                );
+                drained += 1;
+            }
+            Ok(Err(error)) => {
+                warn!(error = %error, "oms command failed");
+                drained += 1;
+            }
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+
+    drained
 }
