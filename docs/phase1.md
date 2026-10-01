@@ -17,7 +17,7 @@
 
 - Withdrawal functionality
 - Full-depth market data/orderbook reconciliation
-- Full OMS/state reconciliation beyond submission/cancellation and startup event collection
+- Full OMS/state reconciliation beyond in-memory submission/cancellation history and startup event collection
 - Strategy orchestration and persistent portfolio risk accounting
 - Latency guarantees
 
@@ -27,4 +27,4 @@
 - `qae-config` keeps credentials env-only to avoid accidental secret persistence.
 - `qae-okx-client` separates signing and request assembly from operation-specific APIs, including WebSocket login and REST order submission payloads.
 - `qae-websocket-engine` centralizes connection lifecycle, startup authentication, private/public stream ingestion, parsing, and market snapshot state for future stream handlers.
-- `qae-risk` and `qae-execution` keep simulated order flow separate while still allowing live-mode tasks to submit authenticated orders and reconcile private events through shared domain types.
+- `qae-risk` and `qae-execution` keep simulated order flow separate while still allowing live-mode tasks to submit authenticated orders, cancel them, and keep in-memory lifecycle history synchronized with private events.

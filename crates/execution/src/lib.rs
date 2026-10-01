@@ -124,6 +124,21 @@ impl ExecutionGateway {
         &self.reconciliation
     }
 
+    #[must_use]
+    pub fn current_report(&self, order_id: &str) -> Option<&ExecutionReport> {
+        self.reconciliation.current_report(order_id)
+    }
+
+    #[must_use]
+    pub fn order_history(&self, order_id: &str) -> Option<&[ExecutionReport]> {
+        self.reconciliation.history_for_order(order_id)
+    }
+
+    #[must_use]
+    pub fn open_orders(&self) -> Vec<&ExecutionReport> {
+        self.reconciliation.open_orders()
+    }
+
     fn prepare_order(&mut self, order: OrderRequest) -> OrderRequest {
         if self.mode != RuntimeMode::Live || order.client_order_id.is_some() {
             return order;
@@ -138,11 +153,18 @@ impl ExecutionGateway {
 #[derive(Debug, Clone, Default)]
 pub struct ReconciliationState {
     pub reports: BTreeMap<String, ExecutionReport>,
+    pub order_records: BTreeMap<String, OrderReconciliationRecord>,
     pub reports_by_client_order_id: BTreeMap<String, String>,
     pub balances: BTreeMap<String, AccountBalance>,
     pub positions: BTreeMap<String, PositionUpdate>,
     pub fills: Vec<FillUpdate>,
     pub portfolio_risk: PortfolioRiskState,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderReconciliationRecord {
+    pub current: ExecutionReport,
+    pub history: Vec<ExecutionReport>,
 }
 
 impl ReconciliationState {
@@ -184,8 +206,8 @@ impl ReconciliationState {
                 };
 
                 report_key
-                    .and_then(|report_key| self.reports.get_mut(&report_key))
-                    .map(|report| {
+                    .and_then(|report_key| self.reports.get(&report_key).cloned())
+                    .map(|mut report| {
                         report.filled_quantity += fill.fill_quantity;
                         report.remaining_quantity =
                             (report.remaining_quantity - fill.fill_quantity).max(0.0);
@@ -195,6 +217,7 @@ impl ReconciliationState {
                         } else {
                             OrderStatus::Filled
                         };
+                        self.upsert_report(report.clone());
                         report.clone()
                     })
             }
@@ -208,6 +231,27 @@ impl ReconciliationState {
     pub fn find_report(&self, cancel: &CancelOrderRequest) -> Option<&ExecutionReport> {
         self.resolve_report_key(cancel)
             .and_then(|report_key| self.reports.get(&report_key))
+    }
+
+    #[must_use]
+    pub fn current_report(&self, order_id: &str) -> Option<&ExecutionReport> {
+        self.order_records.get(order_id).map(|record| &record.current)
+    }
+
+    #[must_use]
+    pub fn history_for_order(&self, order_id: &str) -> Option<&[ExecutionReport]> {
+        self.order_records
+            .get(order_id)
+            .map(|record| record.history.as_slice())
+    }
+
+    #[must_use]
+    pub fn open_orders(&self) -> Vec<&ExecutionReport> {
+        self.order_records
+            .values()
+            .filter(|record| status_is_open(record.current.status))
+            .map(|record| &record.current)
+            .collect()
     }
 
     fn upsert_report(&mut self, report: ExecutionReport) {
@@ -228,7 +272,18 @@ impl ReconciliationState {
             self.reports_by_client_order_id
                 .insert(client_order_id, report.order_id.clone());
         }
+        let report_clone = report.clone();
         self.reports.insert(report.order_id.clone(), report);
+        self.order_records
+            .entry(report_clone.order_id.clone())
+            .and_modify(|record| {
+                record.current = report_clone.clone();
+                record.history.push(report_clone.clone());
+            })
+            .or_insert_with(|| OrderReconciliationRecord {
+                current: report_clone.clone(),
+                history: vec![report_clone],
+            });
     }
 
     fn cancel_open_order(
@@ -655,5 +710,59 @@ mod tests {
 
         assert_eq!(cancelled.status, OrderStatus::Cancelled);
         assert_eq!(gateway.reconciliation_state().portfolio_risk.open_orders, 0);
+    }
+
+    #[test]
+    fn gateway_tracks_order_history_and_open_orders() {
+        let config = AppConfig::default();
+        let mut gateway = ExecutionGateway::new(&config).expect("gateway");
+        let order = OrderRequest::new(
+            InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            2.0,
+        )
+        .and_then(|order| order.with_limit_price(100.0))
+        .expect("order")
+        .with_client_order_id("cid-history");
+
+        let submitted = gateway
+            .submit(
+                &HmacSha256Signer,
+                order,
+                Some(&sample_snapshot()),
+                &FixedClock(
+                    Utc.timestamp_millis_opt(1_700_000_000_000)
+                        .single()
+                        .expect("ts"),
+                ),
+            )
+            .expect("submit");
+
+        assert_eq!(gateway.open_orders().len(), 1);
+        assert_eq!(
+            gateway.current_report(&submitted.order_id).map(|report| report.status),
+            Some(OrderStatus::Accepted)
+        );
+
+        let updated = gateway
+            .apply_private_event(PrivateStreamEvent::Fill(FillUpdate {
+                order_id: submitted.order_id.clone(),
+                client_order_id: Some("cid-history".to_string()),
+                instrument_id: InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+                side: OrderSide::Buy,
+                fill_price: 100.0,
+                fill_quantity: 1.0,
+            }))
+            .expect("update");
+
+        assert_eq!(updated.status, OrderStatus::PartiallyFilled);
+        assert_eq!(
+            gateway
+                .order_history(&submitted.order_id)
+                .map(|history| history.len()),
+            Some(2)
+        );
+        assert_eq!(gateway.open_orders().len(), 1);
     }
 }
