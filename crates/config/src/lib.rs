@@ -1,9 +1,9 @@
 use qae_core::RuntimeMode;
 use serde::Deserialize;
-use std::net::SocketAddr;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
@@ -522,11 +522,10 @@ impl AppConfig {
                 self.control.enable_startup_control_server = enable_startup_control_server;
             }
             if let Some(startup_control_bind_address) = control.startup_control_bind_address {
-                self.control.startup_control_bind_address =
-                    parse_socket_addr(
-                        "control.startup_control_bind_address",
-                        &startup_control_bind_address,
-                    )?;
+                self.control.startup_control_bind_address = parse_socket_addr(
+                    "control.startup_control_bind_address",
+                    &startup_control_bind_address,
+                )?;
             }
             if let Some(startup_control_timeout_ms) = control.startup_control_timeout_ms {
                 self.control.startup_control_timeout_ms = startup_control_timeout_ms;
@@ -714,25 +713,25 @@ impl Default for StrategyConfig {
             max_signals_per_run: 2,
         }
     }
+}
 
-    #[derive(Debug, Clone)]
-    pub struct ControlConfig {
-        pub enable_startup_control_server: bool,
-        pub startup_control_bind_address: SocketAddr,
-        pub startup_control_timeout_ms: u64,
-        pub startup_control_max_requests: u32,
-    }
+#[derive(Debug, Clone)]
+pub struct ControlConfig {
+    pub enable_startup_control_server: bool,
+    pub startup_control_bind_address: SocketAddr,
+    pub startup_control_timeout_ms: u64,
+    pub startup_control_max_requests: u32,
+}
 
-    impl Default for ControlConfig {
-        fn default() -> Self {
-            Self {
-                enable_startup_control_server: false,
-                startup_control_bind_address: "127.0.0.1:9000"
-                    .parse()
-                    .expect("default control bind address must parse"),
-                startup_control_timeout_ms: 3_000,
-                startup_control_max_requests: 4,
-            }
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            enable_startup_control_server: false,
+            startup_control_bind_address: "127.0.0.1:9000"
+                .parse()
+                .expect("default control bind address must parse"),
+            startup_control_timeout_ms: 3_000,
+            startup_control_max_requests: 4,
         }
     }
 }

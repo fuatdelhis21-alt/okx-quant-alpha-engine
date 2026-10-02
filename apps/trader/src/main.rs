@@ -10,8 +10,8 @@ use qae_risk::RiskManager;
 use qae_strategy::{StrategyAction, StrategyRuntime};
 use qae_time::SystemWallClock;
 use qae_websocket_engine::WebsocketEngine;
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -373,23 +373,25 @@ mod tests {
     use qae_config::AppConfig;
     use qae_core::{InstrumentId, OrderSide, OrderType, RuntimeMode};
     use qae_execution::OmsService;
+    use qae_market_data::{MarketDataUpdate, Ticker};
     use qae_strategy::StrategyRuntime;
+    use qae_time::ExchangeTimestamp;
 
     fn test_order_request() -> qae_core::OrderRequest {
         qae_core::OrderRequest {
-            instrument_id: InstrumentId::from("BTC-USDT-SWAP"),
-            client_order_id: "startup-control-order".to_owned(),
+            instrument_id: InstrumentId::new("BTC-USDT-SWAP").expect("instrument"),
+            client_order_id: Some("startup-control-order".to_owned()),
             side: OrderSide::Buy,
             order_type: OrderType::Limit,
             quantity: 1.0,
-            price: Some(60_000.0),
+            limit_price: Some(60_000.0),
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn startup_control_query_state_returns_snapshot() {
         let config = AppConfig::default();
-        let mut service = OmsService::spawn(config.clone()).expect("service should start");
+        let service = OmsService::spawn(config.clone()).expect("service should start");
         let mut strategy = StrategyRuntime::new(&config);
 
         let (response, processed) = process_startup_control_request(
@@ -409,7 +411,11 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        service.handle.shutdown().await.expect("shutdown should succeed");
+        service
+            .handle
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
         service
             .task
             .await
@@ -419,10 +425,28 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn startup_control_submit_order_returns_direct_report() {
-        let mut config = AppConfig::default();
-        config.mode = RuntimeMode::Paper;
+        let config = AppConfig {
+            mode: RuntimeMode::Paper,
+            ..AppConfig::default()
+        };
         let mut service = OmsService::spawn(config.clone()).expect("service should start");
         let mut strategy = StrategyRuntime::new(&config);
+        let instrument_id = InstrumentId::new("BTC-USDT-SWAP").expect("instrument");
+
+        service
+            .handle
+            .publish_market_update(MarketDataUpdate::Ticker(
+                Ticker::new(
+                    instrument_id,
+                    60_000.0,
+                    59_999.0,
+                    60_001.0,
+                    ExchangeTimestamp::from_millis(1_700_000_000_000),
+                )
+                .expect("ticker"),
+            ))
+            .await
+            .expect("market data should publish");
 
         let (response, processed) = process_startup_control_request(
             &service.handle,
@@ -437,7 +461,10 @@ mod tests {
         assert_eq!(processed, 1);
         match response {
             StartupControlResponse::Report { report } => {
-                assert_eq!(report.order_id, "startup-control-order");
+                assert_eq!(
+                    report.client_order_id.as_deref(),
+                    Some("startup-control-order")
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -450,7 +477,11 @@ mod tests {
             Err(other) => panic!("unexpected channel state: {other:?}"),
         }
 
-        service.handle.shutdown().await.expect("shutdown should succeed");
+        service
+            .handle
+            .shutdown()
+            .await
+            .expect("shutdown should succeed");
         service
             .task
             .await

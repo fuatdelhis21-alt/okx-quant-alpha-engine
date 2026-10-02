@@ -909,6 +909,7 @@ dependencies = [
  "qae-okx-client",
  "qae-risk",
  "qae-time",
+ "serde",
  "thiserror",
  "tokio",
 ]
@@ -1745,6 +1746,8 @@ dependencies = [
  "qae-strategy",
  "qae-time",
  "qae-websocket-engine",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
