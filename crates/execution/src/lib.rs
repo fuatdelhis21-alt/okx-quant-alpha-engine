@@ -67,6 +67,7 @@ pub struct OmsStateSnapshot {
 #[derive(Debug)]
 enum OmsServiceMessage {
     Command(OmsCommand),
+    CommandRequest(OmsCommand, oneshot::Sender<Result<ExecutionReport, ExecutionError>>),
     MarketData(MarketDataUpdate),
     PrivateEvent(PrivateStreamEvent),
     QueryState(oneshot::Sender<OmsStateSnapshot>),
@@ -104,6 +105,15 @@ impl OmsService {
                             }
                         }
                     }
+                    OmsServiceMessage::CommandRequest(command, response_tx) => {
+                        runtime.enqueue(command);
+                        let outcome = match runtime.process_next(&signer, &clock) {
+                            Ok(Some(report)) => Ok(report),
+                            Ok(None) => Err(ExecutionError::MarketDataUnavailable),
+                            Err(error) => Err(error),
+                        };
+                        let _ = response_tx.send(outcome);
+                    }
                     OmsServiceMessage::MarketData(update) => runtime.apply_market_update(update),
                     OmsServiceMessage::PrivateEvent(event) => {
                         if let Some(report) = runtime.apply_private_event(event)
@@ -136,6 +146,22 @@ impl OmsServiceHandle {
             .send(OmsServiceMessage::Command(command))
             .await
             .map_err(|_| OmsServiceSendError::Closed)
+    }
+
+    pub async fn execute_command(
+        &self,
+        command: OmsCommand,
+    ) -> Result<ExecutionReport, OmsServiceCommandError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.message_tx
+            .send(OmsServiceMessage::CommandRequest(command, response_tx))
+            .await
+            .map_err(|_| OmsServiceCommandError::Closed)?;
+
+        response_rx
+            .await
+            .map_err(|_| OmsServiceCommandError::Closed)?
+            .map_err(OmsServiceCommandError::Execution)
     }
 
     pub async fn publish_market_update(
@@ -733,6 +759,14 @@ pub enum OmsServiceQueryError {
     Closed,
 }
 
+#[derive(Debug, Error)]
+pub enum OmsServiceCommandError {
+    #[error("oms service is not running")]
+    Closed,
+    #[error("oms command failed: {0}")]
+    Execution(#[source] ExecutionError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,6 +946,59 @@ mod tests {
         assert_eq!(state.tracked_fills, 0);
         assert_eq!(state.last_known_equity, Some(1_000.0));
         assert_eq!(state.last_known_available_equity, Some(900.0));
+
+        handle.shutdown().await.expect("shutdown sent");
+        task.await.expect("task join").expect("task result");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oms_service_executes_direct_command_requests_without_outcome_duplication() {
+        let service = OmsService::spawn(AppConfig::default()).expect("service");
+        let handle = service.handle.clone();
+        let mut outcomes = service.outcomes;
+        let task = service.task;
+        let instrument_id = InstrumentId::new("BTC-USDT-SWAP").expect("instrument");
+
+        handle
+            .publish_market_update(MarketDataUpdate::Ticker(
+                Ticker::new(
+                    instrument_id.clone(),
+                    100.0,
+                    99.5,
+                    100.5,
+                    ExchangeTimestamp::from_millis(1_700_000_000_000),
+                )
+                .expect("ticker"),
+            ))
+            .await
+            .expect("ticker sent");
+        handle
+            .publish_market_update(MarketDataUpdate::OrderBook(
+                OrderBookSnapshot::new(
+                    instrument_id.clone(),
+                    vec![OrderBookLevel::new(99.5, 1.0).expect("bid")],
+                    vec![OrderBookLevel::new(100.5, 1.0).expect("ask")],
+                    None,
+                    ExchangeTimestamp::from_millis(1_700_000_000_000),
+                )
+                .expect("book"),
+            ))
+            .await
+            .expect("book sent");
+
+        let report = handle
+            .execute_command(OmsCommand::Submit(
+                OrderRequest::new(instrument_id, OrderSide::Buy, OrderType::Market, 1.0)
+                    .expect("order"),
+            ))
+            .await
+            .expect("direct report");
+
+        assert_eq!(report.status, OrderStatus::Filled);
+        assert!(matches!(
+            outcomes.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
 
         handle.shutdown().await.expect("shutdown sent");
         task.await.expect("task join").expect("task result");

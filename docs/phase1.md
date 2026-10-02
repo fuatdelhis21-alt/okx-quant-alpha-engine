@@ -10,7 +10,7 @@
 6. OKX request/signing foundation with endpoint selection and demo-trading header handling.
 7. WebSocket engine scaffolding with bounded channels, reconnect backoff, heartbeat supervision, subscription planning, OKX frame parsing, incremental order-book merge/checksum handling, market snapshot caching, and short-lived public/private startup runtime paths.
 8. Risk guardrails for staged order requests using configured quantity, notional, and price-band limits plus persistent in-memory portfolio accounting from balances, positions, and fills.
-9. Execution bridging that uses paper fills in paper/simulation modes and submits normalized live REST order requests and cancellations in live mode, with an in-memory OMS command queue, async OMS service loop, and queryable runtime state snapshots.
+9. Execution bridging that uses paper fills in paper/simulation modes and submits normalized live REST order requests and cancellations in live mode, with an in-memory OMS command queue, async OMS service loop, direct command execution, and queryable runtime state snapshots.
 10. Trader app bootstrap that validates config and starts in non-live mode by default.
 11. Startup-gated strategy orchestration runtime that maintains its own cached market snapshots and turns market updates into bounded OMS submit/cancel actions.
 

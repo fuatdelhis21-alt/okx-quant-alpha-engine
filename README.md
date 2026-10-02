@@ -29,7 +29,7 @@ The repository now includes a bounded startup strategy path that can turn cached
 - `crates/monitoring`: tracing initialization and secret-safe helpers
 - `crates/okx-client`: OKX V5 request/signing foundation, websocket login, and live order submit/cancel transport
 - `crates/risk`: order guardrails plus persistent portfolio-risk/accounting state
-- `crates/execution`: paper/simulation order lifecycle flow, live execution gateway, reconciliation state/history, OMS command runtime, async OMS service loop, and runtime state snapshots for orchestration/debugging
+- `crates/execution`: paper/simulation order lifecycle flow, live execution gateway, reconciliation state/history, OMS command runtime, async OMS service loop, direct command execution, and runtime state snapshots for orchestration/debugging
 - `crates/strategy`: startup-safe strategy orchestration runtime that maintains strategy snapshot state and converts market updates plus execution reports into bounded OMS actions
 - `crates/websocket-engine`: bounded-channel engine scaffolding, reconnect/backoff, heartbeat, subscriptions, parsing, private event ingestion, and snapshot cache
 - `apps/trader`: startup binary wiring config + monitoring + websocket/risk/execution/strategy orchestration

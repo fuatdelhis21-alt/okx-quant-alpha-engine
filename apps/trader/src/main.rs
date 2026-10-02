@@ -65,9 +65,16 @@ async fn main() -> Result<()> {
                     .on_market_update(update)
                     .context("failed to evaluate strategy runtime market update")?;
                 for action in actions {
-                    dispatch_strategy_action(&oms_handle, action)
+                    let report = dispatch_strategy_action(&oms_handle, action)
                         .await
                         .context("failed to submit strategy action to oms service")?;
+                    strategy.on_execution_report(&report);
+                    info!(
+                        order_id = %report.order_id,
+                        status = ?report.status,
+                        "processed direct oms execution report"
+                    );
+                    processed_outcomes += 1;
                 }
             }
 
@@ -152,16 +159,19 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn dispatch_strategy_action(handle: &OmsServiceHandle, action: StrategyAction) -> Result<()> {
+async fn dispatch_strategy_action(
+    handle: &OmsServiceHandle,
+    action: StrategyAction,
+) -> Result<qae_core::ExecutionReport> {
     let command = match action {
         StrategyAction::Submit(order) => OmsCommand::Submit(order),
         StrategyAction::Cancel(cancel) => OmsCommand::Cancel(cancel),
     };
 
     handle
-        .submit_command(command)
+        .execute_command(command)
         .await
-        .context("oms service command channel closed")
+        .context("oms service command execution failed")
 }
 
 fn drain_oms_outcomes(
