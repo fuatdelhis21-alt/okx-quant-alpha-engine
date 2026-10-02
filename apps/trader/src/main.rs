@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use qae_config::AppConfig;
-use qae_execution::{OmsCommand, OmsService, OmsServiceHandle, OmsServiceOutcome};
+use qae_core::{CancelOrderRequest, ExecutionReport, OrderRequest};
+use qae_execution::{
+    OmsCommand, OmsService, OmsServiceHandle, OmsServiceOutcome, OmsStateSnapshot,
+};
 use qae_monitoring::{MonitoringConfig, init_tracing};
 use qae_okx_client::{HmacSha256Signer, OkxClient};
 use qae_risk::RiskManager;
@@ -8,7 +11,11 @@ use qae_strategy::{StrategyAction, StrategyRuntime};
 use qae_time::SystemWallClock;
 use qae_websocket_engine::WebsocketEngine;
 use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::time;
 use tracing::{info, warn};
 
 #[tokio::main(flavor = "current_thread")]
@@ -131,6 +138,10 @@ async fn main() -> Result<()> {
     }
 
     processed_outcomes += drain_oms_outcomes(&mut oms_service.outcomes, &mut strategy);
+    processed_outcomes += run_startup_control_server(&config, &oms_handle, &mut strategy)
+        .await
+        .context("startup control server failed")?;
+    processed_outcomes += drain_oms_outcomes(&mut oms_service.outcomes, &mut strategy);
     let oms_state = oms_handle
         .query_state()
         .await
@@ -162,7 +173,7 @@ async fn main() -> Result<()> {
 async fn dispatch_strategy_action(
     handle: &OmsServiceHandle,
     action: StrategyAction,
-) -> Result<qae_core::ExecutionReport> {
+) -> Result<ExecutionReport> {
     let command = match action {
         StrategyAction::Submit(order) => OmsCommand::Submit(order),
         StrategyAction::Cancel(cancel) => OmsCommand::Cancel(cancel),
@@ -202,4 +213,248 @@ fn drain_oms_outcomes(
     }
 
     drained
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StartupControlRequest {
+    QueryState,
+    SubmitOrder { order: OrderRequest },
+    CancelOrder { cancel: CancelOrderRequest },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StartupControlResponse {
+    State { state: OmsStateSnapshot },
+    Report { report: ExecutionReport },
+    Error { message: String },
+}
+
+async fn run_startup_control_server(
+    config: &AppConfig,
+    handle: &OmsServiceHandle,
+    strategy: &mut StrategyRuntime,
+) -> Result<usize> {
+    if !config.control.enable_startup_control_server {
+        info!("startup control server disabled by configuration");
+        return Ok(0);
+    }
+
+    let listener = TcpListener::bind(config.control.startup_control_bind_address)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to bind startup control server on {}",
+                config.control.startup_control_bind_address
+            )
+        })?;
+    let timeout = Duration::from_millis(config.control.startup_control_timeout_ms);
+    let mut accepted_requests = 0usize;
+    let mut processed_outcomes = 0usize;
+
+    info!(
+        bind_address = %config.control.startup_control_bind_address,
+        max_requests = config.control.startup_control_max_requests,
+        timeout_ms = config.control.startup_control_timeout_ms,
+        "startup control server listening"
+    );
+
+    while accepted_requests < config.control.startup_control_max_requests as usize {
+        let accept_result = time::timeout(timeout, listener.accept()).await;
+        let (stream, remote_addr) = match accept_result {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => return Err(error).context("failed to accept startup control client"),
+            Err(_) => {
+                info!(
+                    accepted_requests,
+                    "startup control server timed out waiting for more requests"
+                );
+                break;
+            }
+        };
+
+        accepted_requests += 1;
+        processed_outcomes += handle_startup_control_connection(stream, handle, strategy, timeout)
+            .await
+            .with_context(|| format!("failed to process startup control client {remote_addr}"))?;
+    }
+
+    Ok(processed_outcomes)
+}
+
+async fn handle_startup_control_connection(
+    stream: TcpStream,
+    handle: &OmsServiceHandle,
+    strategy: &mut StrategyRuntime,
+    timeout: Duration,
+) -> Result<usize> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut payload = String::new();
+
+    let bytes_read = time::timeout(timeout, reader.read_line(&mut payload))
+        .await
+        .context("startup control request timed out while reading")?
+        .context("failed to read startup control request")?;
+
+    if bytes_read == 0 {
+        return Ok(0);
+    }
+
+    let response = match serde_json::from_str::<StartupControlRequest>(&payload) {
+        Ok(request) => {
+            let (response, processed_reports) =
+                process_startup_control_request(handle, strategy, request).await?;
+            write_startup_control_response(&mut writer, &response, timeout).await?;
+            return Ok(processed_reports);
+        }
+        Err(error) => StartupControlResponse::Error {
+            message: format!("invalid startup control request: {error}"),
+        },
+    };
+
+    write_startup_control_response(&mut writer, &response, timeout).await?;
+    Ok(0)
+}
+
+async fn write_startup_control_response<W>(
+    writer: &mut W,
+    response: &StartupControlResponse,
+    timeout: Duration,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut body = serde_json::to_vec(response).context("failed to serialize control response")?;
+    body.push(b'\n');
+    time::timeout(timeout, writer.write_all(&body))
+        .await
+        .context("startup control response timed out while writing")?
+        .context("failed to write startup control response")?;
+    Ok(())
+}
+
+async fn process_startup_control_request(
+    handle: &OmsServiceHandle,
+    strategy: &mut StrategyRuntime,
+    request: StartupControlRequest,
+) -> Result<(StartupControlResponse, usize)> {
+    match request {
+        StartupControlRequest::QueryState => {
+            let state = handle
+                .query_state()
+                .await
+                .context("failed to query oms state from startup control server")?;
+            Ok((StartupControlResponse::State { state }, 0))
+        }
+        StartupControlRequest::SubmitOrder { order } => {
+            let report = handle
+                .execute_command(OmsCommand::Submit(order))
+                .await
+                .context("failed to execute startup control submit command")?;
+            strategy.on_execution_report(&report);
+            Ok((StartupControlResponse::Report { report }, 1))
+        }
+        StartupControlRequest::CancelOrder { cancel } => {
+            let report = handle
+                .execute_command(OmsCommand::Cancel(cancel))
+                .await
+                .context("failed to execute startup control cancel command")?;
+            strategy.on_execution_report(&report);
+            Ok((StartupControlResponse::Report { report }, 1))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StartupControlRequest, StartupControlResponse, process_startup_control_request};
+    use qae_config::AppConfig;
+    use qae_core::{InstrumentId, OrderSide, OrderType, RuntimeMode};
+    use qae_execution::OmsService;
+    use qae_strategy::StrategyRuntime;
+
+    fn test_order_request() -> qae_core::OrderRequest {
+        qae_core::OrderRequest {
+            instrument_id: InstrumentId::from("BTC-USDT-SWAP"),
+            client_order_id: "startup-control-order".to_owned(),
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            quantity: 1.0,
+            price: Some(60_000.0),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_control_query_state_returns_snapshot() {
+        let config = AppConfig::default();
+        let mut service = OmsService::spawn(config.clone()).expect("service should start");
+        let mut strategy = StrategyRuntime::new(&config);
+
+        let (response, processed) = process_startup_control_request(
+            &service.handle,
+            &mut strategy,
+            StartupControlRequest::QueryState,
+        )
+        .await
+        .expect("query should succeed");
+
+        assert_eq!(processed, 0);
+        match response {
+            StartupControlResponse::State { state } => {
+                assert_eq!(state.cached_snapshots, 0);
+                assert_eq!(state.open_orders, 0);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        service.handle.shutdown().await.expect("shutdown should succeed");
+        service
+            .task
+            .await
+            .expect("task should join")
+            .expect("service should exit cleanly");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_control_submit_order_returns_direct_report() {
+        let mut config = AppConfig::default();
+        config.mode = RuntimeMode::Paper;
+        let mut service = OmsService::spawn(config.clone()).expect("service should start");
+        let mut strategy = StrategyRuntime::new(&config);
+
+        let (response, processed) = process_startup_control_request(
+            &service.handle,
+            &mut strategy,
+            StartupControlRequest::SubmitOrder {
+                order: test_order_request(),
+            },
+        )
+        .await
+        .expect("submit should succeed");
+
+        assert_eq!(processed, 1);
+        match response {
+            StartupControlResponse::Report { report } => {
+                assert_eq!(report.order_id, "startup-control-order");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        match service.outcomes.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Ok(Ok(_)) | Ok(Err(_)) => {
+                panic!("direct control execution should not use shared outcomes queue")
+            }
+            Err(other) => panic!("unexpected channel state: {other:?}"),
+        }
+
+        service.handle.shutdown().await.expect("shutdown should succeed");
+        service
+            .task
+            .await
+            .expect("task should join")
+            .expect("service should exit cleanly");
+    }
 }

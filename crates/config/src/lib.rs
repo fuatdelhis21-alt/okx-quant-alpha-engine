@@ -1,5 +1,6 @@
 use qae_core::RuntimeMode;
 use serde::Deserialize;
+use std::net::SocketAddr;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -23,6 +24,7 @@ pub struct AppConfig {
     pub risk: RiskConfig,
     pub execution: ExecutionConfig,
     pub strategy: StrategyConfig,
+    pub control: ControlConfig,
 }
 
 impl Default for AppConfig {
@@ -36,6 +38,7 @@ impl Default for AppConfig {
             risk: RiskConfig::default(),
             execution: ExecutionConfig::default(),
             strategy: StrategyConfig::default(),
+            control: ControlConfig::default(),
         }
     }
 }
@@ -206,6 +209,26 @@ impl AppConfig {
             self.strategy.max_signals_per_run = parse_u32("STRATEGY_MAX_SIGNALS_PER_RUN", value)?;
         }
 
+        if let Some(value) = map.get("ENABLE_STARTUP_CONTROL_SERVER") {
+            self.control.enable_startup_control_server =
+                parse_bool("ENABLE_STARTUP_CONTROL_SERVER", value)?;
+        }
+
+        if let Some(value) = map.get("STARTUP_CONTROL_BIND_ADDRESS") {
+            self.control.startup_control_bind_address =
+                parse_socket_addr("STARTUP_CONTROL_BIND_ADDRESS", value)?;
+        }
+
+        if let Some(value) = map.get("STARTUP_CONTROL_TIMEOUT_MS") {
+            self.control.startup_control_timeout_ms =
+                parse_u64("STARTUP_CONTROL_TIMEOUT_MS", value)?;
+        }
+
+        if let Some(value) = map.get("STARTUP_CONTROL_MAX_REQUESTS") {
+            self.control.startup_control_max_requests =
+                parse_u32("STARTUP_CONTROL_MAX_REQUESTS", value)?;
+        }
+
         self.okx.credentials = ApiCredentials {
             api_key: map
                 .get("OKX_API_KEY")
@@ -338,6 +361,20 @@ impl AppConfig {
             return Err(ConfigError::InvalidValue {
                 name: "STRATEGY_MAX_SIGNALS_PER_RUN",
                 value: self.strategy.max_signals_per_run.to_string(),
+            });
+        }
+
+        if self.control.startup_control_timeout_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "STARTUP_CONTROL_TIMEOUT_MS",
+                value: self.control.startup_control_timeout_ms.to_string(),
+            });
+        }
+
+        if self.control.startup_control_max_requests == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "STARTUP_CONTROL_MAX_REQUESTS",
+                value: self.control.startup_control_max_requests.to_string(),
             });
         }
 
@@ -477,6 +514,25 @@ impl AppConfig {
             }
             if let Some(max_signals_per_run) = strategy.max_signals_per_run {
                 self.strategy.max_signals_per_run = max_signals_per_run;
+            }
+        }
+
+        if let Some(control) = file_cfg.control {
+            if let Some(enable_startup_control_server) = control.enable_startup_control_server {
+                self.control.enable_startup_control_server = enable_startup_control_server;
+            }
+            if let Some(startup_control_bind_address) = control.startup_control_bind_address {
+                self.control.startup_control_bind_address =
+                    parse_socket_addr(
+                        "control.startup_control_bind_address",
+                        &startup_control_bind_address,
+                    )?;
+            }
+            if let Some(startup_control_timeout_ms) = control.startup_control_timeout_ms {
+                self.control.startup_control_timeout_ms = startup_control_timeout_ms;
+            }
+            if let Some(startup_control_max_requests) = control.startup_control_max_requests {
+                self.control.startup_control_max_requests = startup_control_max_requests;
             }
         }
 
@@ -658,6 +714,27 @@ impl Default for StrategyConfig {
             max_signals_per_run: 2,
         }
     }
+
+    #[derive(Debug, Clone)]
+    pub struct ControlConfig {
+        pub enable_startup_control_server: bool,
+        pub startup_control_bind_address: SocketAddr,
+        pub startup_control_timeout_ms: u64,
+        pub startup_control_max_requests: u32,
+    }
+
+    impl Default for ControlConfig {
+        fn default() -> Self {
+            Self {
+                enable_startup_control_server: false,
+                startup_control_bind_address: "127.0.0.1:9000"
+                    .parse()
+                    .expect("default control bind address must parse"),
+                startup_control_timeout_ms: 3_000,
+                startup_control_max_requests: 4,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -736,6 +813,16 @@ fn parse_url(name: &'static str, value: &str) -> Result<Url, ConfigError> {
     })
 }
 
+fn parse_socket_addr(name: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {
+    value
+        .trim()
+        .parse::<SocketAddr>()
+        .map_err(|_| ConfigError::InvalidValue {
+            name,
+            value: value.to_owned(),
+        })
+}
+
 fn parse_csv_list(value: &str) -> Result<Vec<String>, ConfigError> {
     let parsed = value
         .split(',')
@@ -761,6 +848,7 @@ struct TomlAppConfig {
     risk: Option<TomlRiskConfig>,
     execution: Option<TomlExecutionConfig>,
     strategy: Option<TomlStrategyConfig>,
+    control: Option<TomlControlConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -822,6 +910,14 @@ struct TomlStrategyConfig {
     max_signals_per_run: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TomlControlConfig {
+    enable_startup_control_server: Option<bool>,
+    startup_control_bind_address: Option<String>,
+    startup_control_timeout_ms: Option<u64>,
+    startup_control_max_requests: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,6 +937,7 @@ mod tests {
         assert!(!cfg.market_data.connect_private_stream_on_startup);
         assert_eq!(cfg.risk.max_open_orders, 20);
         assert!(!cfg.strategy.enable_startup_strategy);
+        assert!(!cfg.control.enable_startup_control_server);
     }
 
     #[test]
@@ -902,6 +999,26 @@ mod tests {
         assert_eq!(cfg.strategy.entry_spread_bps, 40.0);
         assert_eq!(cfg.strategy.cancel_spread_bps, 90.0);
         assert_eq!(cfg.strategy.max_signals_per_run, 3);
+    }
+
+    #[test]
+    fn env_overrides_control_settings() {
+        let mut cfg = AppConfig::default();
+        cfg.apply_env_overrides(vec![
+            ("ENABLE_STARTUP_CONTROL_SERVER", "true"),
+            ("STARTUP_CONTROL_BIND_ADDRESS", "127.0.0.1:9100"),
+            ("STARTUP_CONTROL_TIMEOUT_MS", "1500"),
+            ("STARTUP_CONTROL_MAX_REQUESTS", "2"),
+        ])
+        .expect("env should parse");
+
+        assert!(cfg.control.enable_startup_control_server);
+        assert_eq!(
+            cfg.control.startup_control_bind_address,
+            "127.0.0.1:9100".parse().expect("addr")
+        );
+        assert_eq!(cfg.control.startup_control_timeout_ms, 1_500);
+        assert_eq!(cfg.control.startup_control_max_requests, 2);
     }
 
     #[test]

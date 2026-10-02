@@ -9,6 +9,7 @@ use qae_okx_client::{
 };
 use qae_risk::{PortfolioRiskManager, PortfolioRiskState, RiskManager, RiskViolation};
 use qae_time::{SystemWallClock, WallClock};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -48,7 +49,7 @@ pub struct OmsRuntime {
 
 pub type OmsServiceOutcome = Result<ExecutionReport, ExecutionError>;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OmsStateSnapshot {
     pub cached_snapshots: usize,
     pub snapshot_instruments: Vec<InstrumentId>,

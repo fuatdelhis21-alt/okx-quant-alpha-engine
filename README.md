@@ -16,7 +16,7 @@ The repository currently delivers a safe-by-default foundation plus the next sca
 - Risk guardrails for staged order requests
 - Paper/simulation execution scaffolding plus normalized live REST order submission and cancellation
 - Optional authenticated private WebSocket startup login, subscription, and private event parsing flow
-- Persistent in-memory portfolio risk accounting, async OMS service orchestration, and a strategy runtime that owns its own snapshot-driven startup decisions
+- Persistent in-memory portfolio risk accounting, async OMS service orchestration, a strategy runtime that owns its own snapshot-driven startup decisions, and an optional localhost startup control server
 
 The repository now includes a bounded startup strategy path that can turn cached snapshots into OMS submit/cancel commands, while live order acknowledgements, cancellations, private stream events, and portfolio risk state continue to flow through shared execution-report types.
 
@@ -93,6 +93,11 @@ Environment variables:
   - `STRATEGY_ENTRY_SPREAD_BPS`
   - `STRATEGY_CANCEL_SPREAD_BPS`
   - `STRATEGY_MAX_SIGNALS_PER_RUN`
+- Startup control server
+  - `ENABLE_STARTUP_CONTROL_SERVER`
+  - `STARTUP_CONTROL_BIND_ADDRESS`
+  - `STARTUP_CONTROL_TIMEOUT_MS`
+  - `STARTUP_CONTROL_MAX_REQUESTS`
 
 Defaults are documented in `crates/config/src/lib.rs`.
 
@@ -125,3 +130,9 @@ To exercise the bounded startup strategy loop on cached public snapshots, also e
 
 - `ENABLE_STARTUP_STRATEGY=true`
 - optionally tune `STRATEGY_ORDER_QUANTITY`, `STRATEGY_ENTRY_SPREAD_BPS`, `STRATEGY_CANCEL_SPREAD_BPS`, and `STRATEGY_MAX_SIGNALS_PER_RUN`
+
+To expose a short-lived localhost control/status socket during startup orchestration, also enable:
+
+- `ENABLE_STARTUP_CONTROL_SERVER=true`
+- optionally tune `STARTUP_CONTROL_BIND_ADDRESS`, `STARTUP_CONTROL_TIMEOUT_MS`, and `STARTUP_CONTROL_MAX_REQUESTS`
+- send newline-delimited JSON requests like `{"type":"query_state"}`, `{"type":"submit_order","order":{...}}`, or `{"type":"cancel_order","cancel":{...}}`

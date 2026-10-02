@@ -17,5 +17,7 @@ qae-risk = { path = "../../crates/risk" }
 qae-strategy = { path = "../../crates/strategy" }
 qae-time = { path = "../../crates/time" }
 qae-websocket-engine = { path = "../../crates/websocket-engine" }
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

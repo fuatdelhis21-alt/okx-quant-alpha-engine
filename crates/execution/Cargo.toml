@@ -12,6 +12,7 @@ qae-market-data = { path = "../market-data" }
 qae-okx-client = { version = "0.1.0", path = "../okx-client" }
 qae-risk = { path = "../risk" }
 qae-time = { version = "0.1.0", path = "../time" }
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
