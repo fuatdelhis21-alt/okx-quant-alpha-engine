@@ -67,7 +67,10 @@ pub struct OmsStateSnapshot {
 #[derive(Debug)]
 enum OmsServiceMessage {
     Command(OmsCommand),
-    CommandRequest(OmsCommand, oneshot::Sender<Result<ExecutionReport, ExecutionError>>),
+    CommandRequest(
+        OmsCommand,
+        oneshot::Sender<Result<ExecutionReport, ExecutionError>>,
+    ),
     MarketData(MarketDataUpdate),
     PrivateEvent(PrivateStreamEvent),
     QueryState(oneshot::Sender<OmsStateSnapshot>),
