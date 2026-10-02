@@ -229,6 +229,11 @@ impl AppConfig {
                 parse_u32("STARTUP_CONTROL_MAX_REQUESTS", value)?;
         }
 
+        if let Some(value) = map.get("STARTUP_CONTROL_RUN_UNTIL_SHUTDOWN") {
+            self.control.startup_control_run_until_shutdown =
+                parse_bool("STARTUP_CONTROL_RUN_UNTIL_SHUTDOWN", value)?;
+        }
+
         self.okx.credentials = ApiCredentials {
             api_key: map
                 .get("OKX_API_KEY")
@@ -533,6 +538,12 @@ impl AppConfig {
             if let Some(startup_control_max_requests) = control.startup_control_max_requests {
                 self.control.startup_control_max_requests = startup_control_max_requests;
             }
+            if let Some(startup_control_run_until_shutdown) =
+                control.startup_control_run_until_shutdown
+            {
+                self.control.startup_control_run_until_shutdown =
+                    startup_control_run_until_shutdown;
+            }
         }
 
         Ok(())
@@ -721,6 +732,7 @@ pub struct ControlConfig {
     pub startup_control_bind_address: SocketAddr,
     pub startup_control_timeout_ms: u64,
     pub startup_control_max_requests: u32,
+    pub startup_control_run_until_shutdown: bool,
 }
 
 impl Default for ControlConfig {
@@ -732,6 +744,7 @@ impl Default for ControlConfig {
                 .expect("default control bind address must parse"),
             startup_control_timeout_ms: 3_000,
             startup_control_max_requests: 4,
+            startup_control_run_until_shutdown: false,
         }
     }
 }
@@ -915,6 +928,7 @@ struct TomlControlConfig {
     startup_control_bind_address: Option<String>,
     startup_control_timeout_ms: Option<u64>,
     startup_control_max_requests: Option<u32>,
+    startup_control_run_until_shutdown: Option<bool>,
 }
 
 #[cfg(test)]
@@ -937,6 +951,7 @@ mod tests {
         assert_eq!(cfg.risk.max_open_orders, 20);
         assert!(!cfg.strategy.enable_startup_strategy);
         assert!(!cfg.control.enable_startup_control_server);
+        assert!(!cfg.control.startup_control_run_until_shutdown);
     }
 
     #[test]
@@ -1008,6 +1023,7 @@ mod tests {
             ("STARTUP_CONTROL_BIND_ADDRESS", "127.0.0.1:9100"),
             ("STARTUP_CONTROL_TIMEOUT_MS", "1500"),
             ("STARTUP_CONTROL_MAX_REQUESTS", "2"),
+            ("STARTUP_CONTROL_RUN_UNTIL_SHUTDOWN", "true"),
         ])
         .expect("env should parse");
 
@@ -1018,6 +1034,7 @@ mod tests {
         );
         assert_eq!(cfg.control.startup_control_timeout_ms, 1_500);
         assert_eq!(cfg.control.startup_control_max_requests, 2);
+        assert!(cfg.control.startup_control_run_until_shutdown);
     }
 
     #[test]
